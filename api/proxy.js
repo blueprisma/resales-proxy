@@ -1,4 +1,66 @@
 import https from 'https';
+import http from 'http';
+import { URL } from 'url';
+
+function fetchWithRedirects(targetUrl, options, redirectCount = 0) {
+    return new Promise((resolve, reject) => {
+        if (redirectCount > 5) {
+            reject(new Error("Demasiados redireccionamientos (Límite de 5 excedido)"));
+            return;
+        }
+
+        const parsedUrl = new URL(targetUrl);
+        const isHttps = parsedUrl.protocol === 'https:';
+        const client = isHttps ? https : http;
+
+        const reqOptions = {
+            ...options,
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (isHttps ? 443 : 80),
+            path: parsedUrl.pathname + parsedUrl.search,
+        };
+
+        // Si detecta el subdominio de exportación, forzamos bypass por IP y SNI
+        if (reqOptions.hostname === 'export.resales-online.com') {
+            reqOptions.hostname = '213.162.201.20';
+            reqOptions.servername = 'export.resales-online.com';
+            reqOptions.headers = reqOptions.headers || {};
+            reqOptions.headers['Host'] = 'export.resales-online.com';
+        }
+
+        const req = client.request(reqOptions, (res) => {
+            // Seguir redirecciones de forma automática e interna en Vercel
+            if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+                let redirectUrl = res.headers.location;
+                if (!redirectUrl) {
+                    reject(new Error(`Redirección ${res.statusCode} sin cabecera Location.`));
+                    return;
+                }
+                if (!redirectUrl.startsWith('http')) {
+                    redirectUrl = new URL(redirectUrl, targetUrl).href;
+                }
+                resolve(fetchWithRedirects(redirectUrl, options, redirectCount + 1));
+                return;
+            }
+
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                resolve({
+                    statusCode: res.statusCode,
+                    data: data
+                });
+            });
+        });
+
+        req.on('error', (err) => reject(err));
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Timeout de conexión con el servidor de origen'));
+        });
+        req.end();
+    });
+}
 
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -17,39 +79,21 @@ export default async function handler(req, res) {
         return;
     }
 
-    // Ruta optimizada a través de la central web principal del proveedor para máxima estabilidad DNS
-    const targetUrl = `https://www.resales-online.com/export/xml/v3/Ventas/Resales?p1=${p1}&p2=${p2}&n=${n}&P_NewDevs=1${i === 'True' ? '&i=True' : ''}`;
+    const initialUrl = `https://export.resales-online.com/export/xml/v3/Ventas/Resales?p1=${p1}&p2=${p2}&n=${n}&P_NewDevs=1${i === 'True' ? '&i=True' : ''}`;
 
-    const requestOptions = {
+    const baseOptions = {
+        method: 'GET',
         headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'application/xml, text/xml, */*'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         },
-        timeout: 12000
+        rejectUnauthorized: false
     };
 
-    const httpsReq = https.get(targetUrl, requestOptions, (httpsRes) => {
-        let data = '';
-        httpsRes.setEncoding('utf8');
-
-        httpsRes.on('data', (chunk) => {
-            data += chunk;
-        });
-
-        httpsRes.on('end', () => {
-            res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-            res.status(httpsRes.statusCode).send(data);
-        });
-    });
-
-    httpsReq.on('error', (error) => {
-        res.status(500).json({ error: "Fallo de comunicación con la central pública del proveedor.", detalle: error.message });
-    });
-
-    httpsReq.on('timeout', () => {
-        httpsReq.destroy();
-        res.status(504).json({ error: "El servidor de origen tardó demasiado tiempo en procesar los registros." });
-    });
-
-    httpsReq.end();
+    try {
+        const result = await fetchWithRedirects(initialUrl, baseOptions);
+        res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+        res.status(200).send(result.data); // Siempre devolvemos un 200 limpio con los datos resueltos
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 }

@@ -10,30 +10,20 @@ export default function handler(req, res) {
         return;
     }
 
-    const { p1, p2, n = '30', i = 'False' } = req.query;
-
-    if (!p1 || !p2) {
-        res.status(400).json({ error: "Parámetros de credenciales ausentes." });
-        return;
-    }
-
-    const ipAddress = "213.162.201.20";
-    const hostname = "export.resales-online.com";
-    const path = `/export/xml/v3/Ventas/Resales?p1=${p1}&p2=${p2}&n=${n}&P_NewDevs=1${i === 'True' ? '&i=True' : ''}`;
+    // Apunte directo al dominio y credenciales del Feed real de tu captura
+    const hostname = "xmlout.resales-online.com";
+    const path = "/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&Sandbox=TRUE";
 
     const options = {
-        hostname: ipAddress,
+        hostname: hostname,
         port: 443,
         path: path,
         method: 'GET',
         headers: {
-            'Host': hostname,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/xml, text/xml, */*'
         },
-        servername: hostname,
-        rejectUnauthorized: false,
-        timeout: 25000
+        timeout: 55000
     };
 
     return new Promise((resolve) => {
@@ -51,13 +41,7 @@ export default function handler(req, res) {
         });
 
         httpsReq.on('error', (error) => {
-            res.status(500).json({ error: "Error en el puente proxy: " + error.message });
-            resolve();
-        });
-
-        httpsReq.on('timeout', () => {
-            httpsReq.destroy();
-            res.status(504).json({ error: "El servidor de origen en España tardó demasiado en responder." });
+            res.status(500).json({ error: "Error en la tubería del Feed: " + error.message });
             resolve();
         });
 

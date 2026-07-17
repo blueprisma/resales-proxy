@@ -1,7 +1,6 @@
 import https from 'https';
 
 export default function handler(req, res) {
-    // Cabeceras de control CORS universales
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -11,7 +10,7 @@ export default function handler(req, res) {
         return;
     }
 
-    const { p1, p2, n = '50', i = 'False' } = req.query;
+    const { p1, p2, n = '20', i = 'False' } = req.query;
 
     if (!p1 || !p2) {
         res.status(400).json({ error: "Parámetros de credenciales ausentes." });
@@ -29,23 +28,20 @@ export default function handler(req, res) {
         method: 'GET',
         headers: {
             'Host': hostname,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         },
         servername: hostname,
         rejectUnauthorized: false,
-        timeout: 15000
+        timeout: 25000
     };
 
-    // FUERZA BRUTA ASÍNCRONA: Obliga a Vercel a mantener el contenedor vivo hasta resolver los datos
     return new Promise((resolve) => {
         const httpsReq = https.request(options, (httpsRes) => {
             let data = '';
             httpsRes.setEncoding('utf8');
 
-            httpsRes.on('data', (chunk) => {
-                data += chunk;
-            });
-
+            httpsRes.on('data', (chunk) => { data += chunk; });
+            
             httpsRes.on('end', () => {
                 res.setHeader('Content-Type', 'application/xml; charset=utf-8');
                 res.status(httpsRes.statusCode).send(data);
@@ -60,7 +56,7 @@ export default function handler(req, res) {
 
         httpsReq.on('timeout', () => {
             httpsReq.destroy();
-            res.status(504).json({ error: "Tiempo de espera agotado con el servidor de España." });
+            res.status(504).json({ error: "Timeout de ráfaga con España" });
             resolve();
         });
 

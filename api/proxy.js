@@ -1,7 +1,7 @@
 import https from 'https';
 
 export default function handler(req, res) {
-    // Cabeceras de control CORS
+    // Cabeceras de control CORS universales
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -14,7 +14,7 @@ export default function handler(req, res) {
     const { p1, p2, n = '50', i = 'False' } = req.query;
 
     if (!p1 || !p2) {
-        res.status(400).json({ error: "Parámetros p1 o p2 ausentes." });
+        res.status(400).json({ error: "Parámetros de credenciales ausentes." });
         return;
     }
 
@@ -32,24 +32,38 @@ export default function handler(req, res) {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         },
         servername: hostname,
-        rejectUnauthorized: false
+        rejectUnauthorized: false,
+        timeout: 15000
     };
 
-    const httpsReq = https.request(options, (httpsRes) => {
-        // Indicamos que transferiremos un stream XML directo
-        res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-        res.status(httpsRes.statusCode);
-        
-        // Canalización directa (pipe) sin almacenamiento intermedio en Vercel
-        httpsRes.pipe(res);
-    });
+    // FUERZA BRUTA ASÍNCRONA: Obliga a Vercel a mantener el contenedor vivo hasta resolver los datos
+    return new Promise((resolve) => {
+        const httpsReq = https.request(options, (httpsRes) => {
+            let data = '';
+            httpsRes.setEncoding('utf8');
 
-    httpsReq.on('error', (error) => {
-        console.error("Error en streaming del Proxy Vercel:", error);
-        if (!res.headersSent) {
+            httpsRes.on('data', (chunk) => {
+                data += chunk;
+            });
+
+            httpsRes.on('end', () => {
+                res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+                res.status(httpsRes.statusCode).send(data);
+                resolve();
+            });
+        });
+
+        httpsReq.on('error', (error) => {
             res.status(500).json({ error: error.message });
-        }
-    });
+            resolve();
+        });
 
-    httpsReq.end();
+        httpsReq.on('timeout', () => {
+            httpsReq.destroy();
+            res.status(504).json({ error: "Tiempo de espera agotado con el servidor de España." });
+            resolve();
+        });
+
+        httpsReq.end();
+    });
 }

@@ -1,6 +1,7 @@
 import https from 'https';
 
 export default function handler(req, res) {
+    // Cabeceras de control CORS universales
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -10,7 +11,7 @@ export default function handler(req, res) {
         return;
     }
 
-    const { p1, p2, n = '20', i = 'False' } = req.query;
+    const { p1, p2, n = '30', i = 'False' } = req.query;
 
     if (!p1 || !p2) {
         res.status(400).json({ error: "Parámetros de credenciales ausentes." });
@@ -22,13 +23,14 @@ export default function handler(req, res) {
     const path = `/export/xml/v3/Ventas/Resales?p1=${p1}&p2=${p2}&n=${n}&P_NewDevs=1${i === 'True' ? '&i=True' : ''}`;
 
     const options = {
-        hostname: ipAddress,
+        hostname: ipAddress, // Forzamos la IP directa para destruir el error ENOTFOUND
         port: 443,
         path: path,
         method: 'GET',
         headers: {
-            'Host': hostname,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'Host': hostname, // Engañamos al servidor de España para que valide el certificado SSL
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'application/xml, text/xml, */*'
         },
         servername: hostname,
         rejectUnauthorized: false,
@@ -50,13 +52,13 @@ export default function handler(req, res) {
         });
 
         httpsReq.on('error', (error) => {
-            res.status(500).json({ error: error.message });
+            res.status(500).json({ error: "Error en el puente proxy: " + error.message });
             resolve();
         });
 
         httpsReq.on('timeout', () => {
             httpsReq.destroy();
-            res.status(504).json({ error: "Timeout de ráfaga con España" });
+            res.status(504).json({ error: "El servidor de origen en España tardó demasiado en responder." });
             resolve();
         });
 

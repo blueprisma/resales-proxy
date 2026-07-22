@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 let cachedProperties = null;
 let lastCachedTime = 0;
 let lastXmlPreview = '';
-const CACHE_DURATION = 2 * 60 * 60 * 1000; // 2 Horas
+const CACHE_DURATION = 2 * 60 * 60 * 1000; // 2 Horas de caché en RAM
 
 function parseXmlProperties(xmlString) {
     const properties = [];
@@ -126,26 +126,19 @@ function fetchXmlUrl(url) {
 }
 
 async function fetchXmlFromSpain() {
-    // 1. Intento con URL Principal de Producción
-    const mainUrl = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
-    let xmlText = await fetchXmlUrl(mainUrl);
-    let items = parseXmlProperties(xmlText);
+    const productionUrl = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
+    const xmlText = await fetchXmlUrl(productionUrl);
 
-    // 2. Si el feed principal viene vacío, intentar con el flag de Sandbox
-    if (items.length === 0) {
-        console.log("Feed principal vacío. Probando modo Sandbox...");
-        const sandboxUrl = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Sandbox=true";
-        const sandboxXml = await fetchXmlUrl(sandboxUrl);
-        const sandboxItems = parseXmlProperties(sandboxXml);
-
-        if (sandboxItems.length > 0) {
-            xmlText = sandboxXml;
-            items = sandboxItems;
-        }
+    // Detección explícita del bloqueo de 10 minutos de Resales Online
+    if (xmlText.includes('error_message') || xmlText.includes('previous instance')) {
+        console.warn("Resales Online reporta bloqueo por limite de tiempo (10 min cooldown).");
+        lastXmlPreview = xmlText;
+        return { items: [], isRateLimited: true, rawXml: xmlText };
     }
 
+    const items = parseXmlProperties(xmlText);
     lastXmlPreview = xmlText.substring(0, 800);
-    return { items, rawXml: xmlText };
+    return { items, isRateLimited: false, rawXml: xmlText };
 }
 
 app.get('/api/properties', async (req, res) => {
@@ -157,10 +150,17 @@ app.get('/api/properties', async (req, res) => {
         const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
 
         if (!cachedProperties || isCacheExpired || forceRefresh) {
-            console.log("Consultando servidor de Resales Online...");
-            const { items } = await fetchXmlFromSpain();
-            cachedProperties = items;
-            lastCachedTime = Date.now();
+            console.log("Solicitando catálogo a Resales Online...");
+            const { items, isRateLimited } = await fetchXmlFromSpain();
+
+            if (isRateLimited && cachedProperties && cachedProperties.length > 0) {
+                console.log("Usando versión en caché previa mientras se libera el bloqueo de España.");
+            } else {
+                cachedProperties = items;
+                if (!isRateLimited) {
+                    lastCachedTime = Date.now();
+                }
+            }
         }
 
         const startIndex = (page - 1) * limit;
@@ -177,7 +177,7 @@ app.get('/api/properties', async (req, res) => {
             debugPreview: cachedProperties.length === 0 ? lastXmlPreview : undefined
         });
     } catch (error) {
-        console.error("Error procesando el catálogo:", error);
+        console.error("Error procesando el catálogo de producción:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });

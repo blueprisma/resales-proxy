@@ -10,15 +10,15 @@ export default function handler(req, res) {
         return;
     }
 
-    // 1. Dominio y Credenciales reales tomadas de tu captura activa
+    // 1. Extraer los parámetros de página enviados por Wix Studio
+    const pageNo = req.query.p_PageNo || req.query.p_page || req.query.P_PageNo || '1';
+    const pageSize = req.query.p_PageSize || req.query.P_PageSize || '200';
+
+    // 2. Dominio y Credenciales reales (Modo LIVE / Producción)
     const hostname = "xmlout.resales-online.com";
-    const basePath = "/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&Sandbox=TRUE";
-
-    // 2. Extraer dinámicamente los parámetros de paginación enviados por Wix (p_PageNo, p_PageSize)
-    const incomingParams = new URLSearchParams(req.query).toString();
-
-    // 3. Concatenar los parámetros de página a la URL oficial de España
-    const finalPath = incomingParams ? `${basePath}&${incomingParams}` : basePath;
+    
+    // Se elimina Sandbox=TRUE y se inyecta la paginación directa a la API de España
+    const finalPath = `/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_PageNo=${pageNo}&P_PageSize=${pageSize}&p_PageNo=${pageNo}&p_PageSize=${pageSize}`;
 
     const options = {
         hostname: hostname,

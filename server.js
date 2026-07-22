@@ -1,10 +1,10 @@
 import express from 'express';
-import zlib from 'zlib';
 import https from 'https';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Permisos CORS para comunicación segura con Wix Studio
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -13,134 +13,145 @@ app.use((req, res, next) => {
     next();
 });
 
+// Configuración de caché interna en memoria
 let cachedProperties = null;
 let lastCachedTime = 0;
-let lastXmlPreview = '';
-const CACHE_DURATION = 2 * 60 * 60 * 1000; // 2 Horas de caché en RAM
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas de ciclo de vida de la caché
 
-function parseXmlProperties(xmlString) {
-    const properties = [];
-    if (!xmlString || typeof xmlString !== 'string') return properties;
+// Saneamiento y mapeo robusto de tags XML a JSON para Wix Studio
+function parseSingleProperty(block) {
+    const getTagValue = (tag) => {
+        const regex = new RegExp(`<${tag}>([^<]*)</${tag}>`, 'i');
+        const match = block.match(regex);
+        return match ? match[1].trim() : '';
+    };
 
-    let cleanXml = xmlString;
-    cleanXml = cleanXml.replace(/<(?:Property|property|PropertyDetails|property_details)\b/gi, '<Property');
-    cleanXml = cleanXml.replace(/<\/(?:Property|property|PropertyDetails|property_details)>/gi, '</Property>');
+    // Clave primaria única para la base de datos de Wix
+    const propertyid = getTagValue('Reference') || getTagValue('PropertyRefNo') || getTagValue('RefNo') || '';
+    if (!propertyid) return null;
 
-    if (!cleanXml.includes('<Property')) return properties;
+    const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
+    const location = getTagValue('Area') || getTagValue('Location') || getTagValue('Town') || 'Alicante';
+    const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
+    const marketType = isNewDev ? 'New Development' : 'Resale';
+    const price = parseFloat(getTagValue('Price')) || 0;
+    const beds = parseInt(getTagValue('Bedrooms')) || parseInt(getTagValue('Beds')) || 0;
+    const baths = parseInt(getTagValue('Bathrooms')) || parseInt(getTagValue('Baths')) || 0;
+    const sqm = parseFloat(getTagValue('Built')) || parseFloat(getTagValue('sqm')) || 0;
+    const propertyType = getTagValue('Type') || 'Property';
+    const description = getTagValue('Description') || getTagValue('Desc') || '';
 
-    const propertyBlocks = cleanXml.split('<Property');
-    propertyBlocks.shift(); 
-
-    for (let rawBlock of propertyBlocks) {
-        const block = rawBlock.split('</Property>')[0];
-
-        const getTagValue = (tag) => {
-            const regex = new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`, 'i');
-            const match = block.match(regex);
-            return match ? match[1].trim() : '';
-        };
-
-        const propertyid = getTagValue('PropertyRefNo') || getTagValue('Reference') || getTagValue('RefNo') || getTagValue('id') || getTagValue('ID') || '';
-        if (!propertyid) continue;
-
-        const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
-        const location = getTagValue('Area') || getTagValue('Location') || getTagValue('Town') || 'Costa Blanca';
-        const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
-        const marketType = isNewDev ? 'New Development' : 'Resale';
-        const price = parseFloat(getTagValue('Price')) || 0;
-        const beds = parseInt(getTagValue('Bedrooms')) || parseInt(getTagValue('Beds')) || 0;
-        const baths = parseInt(getTagValue('Bathrooms')) || parseInt(getTagValue('Baths')) || 0;
-        const sqm = parseFloat(getTagValue('Built')) || parseFloat(getTagValue('sqm')) || 0;
-        const propertyType = getTagValue('Type') || getTagValue('PropertyType') || 'Property';
-        const description = getTagValue('Description') || getTagValue('Desc') || '';
-
-        let images = [];
-        const picturesMatch = block.match(/<(?:Pictures|images|Pictures_List)[^>]*>([\s\S]*?)<\/(?:Pictures|images|Pictures_List)>/i);
-        if (picturesMatch) {
-            const urlMatches = picturesMatch[1].match(/<(?:Url|url)[^>]*>([^<]*)<\/(?:Url|url)>/gi);
-            if (urlMatches) {
-                images = urlMatches.map(m => m.replace(/<\/?(?:Url|url)[^>]*>/gi, '').trim());
-            }
+    // Extracción limpia de la lista de imágenes
+    let images = [];
+    const picturesMatch = block.match(/<Pictures>([\s\S]*?)<\/Pictures>/i);
+    if (picturesMatch) {
+        const urlMatches = picturesMatch[1].match(/<Url>([^<]*)<\/Url>/gi);
+        if (urlMatches) {
+            images = urlMatches.map(m => m.replace(/<\/?Url>/gi, '').trim());
         }
-
-        if (images.length === 0) {
-            const urlMatches = block.match(/<(?:Url|url)[^>]*>([^<]*)<\/(?:Url|url)>/gi);
-            if (urlMatches) {
-                images = urlMatches.map(m => m.replace(/<\/?(?:Url|url)[^>]*>/gi, '').trim());
-            }
-        }
-
-        const mainimage = images.length > 0 ? images[0] : '';
-
-        properties.push({
-            _id: propertyid,
-            title,
-            location,
-            marketType,
-            price,
-            beds,
-            baths,
-            mainimage,
-            propertyid,
-            sqm,
-            propertyType,
-            images: images.join(','),
-            description
-        });
     }
 
-    return properties;
+    if (images.length === 0) {
+        const urlMatches = block.match(/<Url>([^<]*)<\/Url>/gi);
+        if (urlMatches) {
+            images = urlMatches.map(m => m.replace(/<\/?Url>/gi, '').trim());
+        }
+    }
+
+    const mainimage = images.length > 0 ? images[0] : 'https://wixideas.wixsite.com/images/placeholder.png';
+
+    return {
+        _id: propertyid, // _id requerido en WixData para bulkSave
+        title,
+        location,
+        marketType,
+        price,
+        beds,
+        baths,
+        mainimage,
+        propertyid,
+        sqm,
+        propertyType,
+        images,
+        description
+    };
 }
 
-function fetchXmlUrl(url) {
+// Descarga en formato streaming interceptando bloqueos por concurrencia
+async function fetchAndParseXmlStream() {
     return new Promise((resolve, reject) => {
-        https.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept-Encoding': 'gzip, deflate',
-                'Accept': '*/*'
-            }
-        }, (res) => {
+        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
+        
+        https.get(url, (res) => {
             if (res.statusCode !== 200) {
-                return reject(new Error(`Estatus HTTP de España: ${res.statusCode}`));
+                reject(new Error(`El servidor de origen respondió con código HTTP: ${res.statusCode}`));
+                return;
             }
 
-            let stream = res;
-            const encoding = res.headers['content-encoding'];
+            const properties = [];
+            let buffer = '';
+            let isLocked = false;
 
-            if (encoding === 'gzip') {
-                stream = res.pipe(zlib.createGunzip());
-            } else if (encoding === 'deflate') {
-                stream = res.pipe(zlib.createInflate());
-            }
+            res.setEncoding('utf8');
 
-            let chunks = [];
-            stream.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-            stream.on('end', () => {
-                const buffer = Buffer.concat(chunks);
-                resolve(buffer.toString('utf8'));
+            res.on('data', (chunk) => {
+                buffer += chunk;
+                
+                // Defensa temprana: Detecta si la respuesta inicial contiene el bloqueo de 10 minutos
+                if (buffer.length < 1500) {
+                    const hasLockMessage = buffer.includes('previous instance') || 
+                                           buffer.includes('Please wait') || 
+                                           buffer.includes('running');
+                    
+                    if (hasLockMessage) {
+                        isLocked = true;
+                        res.destroy(); // Destruye el canal de inmediato para liberar RAM
+                        reject(new Error("RESALES_CONCURRENCY_LOCK"));
+                        return;
+                    }
+                }
+
+                let propertyIndex = buffer.indexOf('<Property>');
+
+                while (propertyIndex !== -1) {
+                    const closingIndex = buffer.indexOf('</Property>', propertyIndex);
+                    if (closingIndex === -1) {
+                        break; 
+                    }
+
+                    const block = buffer.substring(propertyIndex + 10, closingIndex);
+                    const parsed = parseSingleProperty(block);
+                    
+                    if (parsed) {
+                        properties.push(parsed);
+                    }
+
+                    buffer = buffer.substring(closingIndex + 11);
+                    propertyIndex = buffer.indexOf('<Property>');
+                }
             });
-            stream.on('error', (err) => reject(err));
-        }).on('error', (err) => reject(err));
+
+            res.on('end', () => {
+                if (isLocked) return;
+                
+                if (properties.length === 0 && (buffer.includes('feed_version') || buffer.includes('resalesonline'))) {
+                    reject(new Error("RESALES_EMPTY_RESPONSE_LOCK"));
+                    return;
+                }
+                
+                resolve(properties);
+            });
+
+            res.on('error', (err) => {
+                if (!isLocked) reject(err);
+            });
+        }).on('error', (err) => {
+            reject(err);
+        });
     });
 }
 
-async function fetchXmlFromSpain() {
-    const productionUrl = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
-    const xmlText = await fetchXmlUrl(productionUrl);
-
-    // Detección explícita del bloqueo de 10 minutos de Resales Online
-    if (xmlText.includes('error_message') || xmlText.includes('previous instance')) {
-        console.warn("Resales Online reporta bloqueo por limite de tiempo (10 min cooldown).");
-        lastXmlPreview = xmlText;
-        return { items: [], isRateLimited: true, rawXml: xmlText };
-    }
-
-    const items = parseXmlProperties(xmlText);
-    lastXmlPreview = xmlText.substring(0, 800);
-    return { items, isRateLimited: false, rawXml: xmlText };
-}
-
+// Rutas de la API
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
@@ -150,17 +161,34 @@ app.get('/api/properties', async (req, res) => {
         const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
 
         if (!cachedProperties || isCacheExpired || forceRefresh) {
-            console.log("Solicitando catálogo a Resales Online...");
-            const { items, isRateLimited } = await fetchXmlFromSpain();
-
-            if (isRateLimited && cachedProperties && cachedProperties.length > 0) {
-                console.log("Usando versión en caché previa mientras se libera el bloqueo de España.");
-            } else {
-                cachedProperties = items;
-                if (!isRateLimited) {
-                    lastCachedTime = Date.now();
+            console.log("[Proxy] Solicitando actualización de datos a Resales-Online...");
+            
+            try {
+                const fetchedData = await fetchAndParseXmlStream();
+                cachedProperties = fetchedData;
+                lastCachedTime = Date.now();
+                console.log(`[Proxy] Caché de memoria actualizada. Registros: ${cachedProperties.length}`);
+                res.setHeader('X-Cache-Status', 'MISS');
+            } catch (streamError) {
+                console.warn("[Proxy] Fallo en la llamada directa al proveedor:", streamError.message);
+                
+                if (cachedProperties && cachedProperties.length > 0) {
+                    console.log("[Proxy] Sirviendo caché persistente anterior para evitar desconexión.");
+                    res.setHeader('X-Cache-Status', 'STALE_DUE_TO_LOCK');
+                    res.setHeader('X-Cache-Warning', streamError.message);
+                } else {
+                    if (streamError.message === "RESALES_CONCURRENCY_LOCK" || streamError.message === "RESALES_EMPTY_RESPONSE_LOCK") {
+                        return res.status(429).json({
+                            status: "error",
+                            code: "PROVIDER_LOCKED",
+                            message: "Resales-Online está procesando el XML en segundo plano o el feed está bloqueado temporalmente. Por favor, espere 10 minutos."
+                        });
+                    }
+                    throw streamError;
                 }
             }
+        } else {
+            res.setHeader('X-Cache-Status', 'HIT');
         }
 
         const startIndex = (page - 1) * limit;
@@ -168,20 +196,21 @@ app.get('/api/properties', async (req, res) => {
         const paginatedItems = cachedProperties.slice(startIndex, endIndex);
 
         res.json({
-            success: true,
+            status: "success",
             properties: paginatedItems,
             total: cachedProperties.length,
             page,
             limit,
             hasMore: endIndex < cachedProperties.length,
-            debugPreview: cachedProperties.length === 0 ? lastXmlPreview : undefined
+            cachedAt: new Date(lastCachedTime).toISOString()
         });
+
     } catch (error) {
-        console.error("Error procesando el catálogo de producción:", error);
-        res.status(500).json({ success: false, error: error.message });
+        console.error("[Proxy Error] Fallo crítico:", error);
+        res.status(500).json({ status: "error", message: error.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Servidor activo en el puerto ${PORT}`);
+    console.log(`[Proxy] Servidor corriendo en puerto ${PORT}`);
 });

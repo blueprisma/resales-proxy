@@ -1,4 +1,6 @@
 import express from 'express';
+import zlib from 'zlib';
+import https from 'https';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,24 +14,27 @@ app.use((req, res, next) => {
     next();
 });
 
-// Variables de caché en memoria RAM (Duración: 2 horas)
 let cachedProperties = null;
 let lastCachedTime = 0;
-const CACHE_DURATION = 2 * 60 * 60 * 1000;
+let lastXmlPreview = '';
+const CACHE_DURATION = 2 * 60 * 60 * 1000; // 2 Horas
 
 function parseXmlProperties(xmlString) {
     const properties = [];
     if (!xmlString || typeof xmlString !== 'string') return properties;
 
-    // Normalizar etiquetas para evitar fallos por variaciones de mayúsculas/minúsculas
-    const cleanXml = xmlString.replace(/<property>/gi, '<Property>').replace(/<\/property>/gi, '</Property>');
-    if (!cleanXml.includes('<Property>')) return properties;
+    // Normalizar etiquetas para soportar variaciones del Feed V3
+    let cleanXml = xmlString;
+    cleanXml = cleanXml.replace(/<(?:Property|property|PropertyDetails|property_details)\b/gi, '<Property');
+    cleanXml = cleanXml.replace(/<\/(?:Property|property|PropertyDetails|property_details)>/gi, '</Property>');
 
-    const propertyBlocks = cleanXml.split('<Property>');
-    propertyBlocks.shift(); // Quitar la cabecera XML
+    if (!cleanXml.includes('<Property')) return properties;
 
-    for (let block of propertyBlocks) {
-        block = block.split('</Property>')[0];
+    const propertyBlocks = cleanXml.split('<Property');
+    propertyBlocks.shift(); 
+
+    for (let rawBlock of propertyBlocks) {
+        const block = rawBlock.split('</Property>')[0];
 
         const getTagValue = (tag) => {
             const regex = new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`, 'i');
@@ -37,7 +42,7 @@ function parseXmlProperties(xmlString) {
             return match ? match[1].trim() : '';
         };
 
-        const propertyid = getTagValue('PropertyRefNo') || getTagValue('Reference') || getTagValue('RefNo') || getTagValue('id') || '';
+        const propertyid = getTagValue('PropertyRefNo') || getTagValue('Reference') || getTagValue('RefNo') || getTagValue('id') || getTagValue('ID') || '';
         if (!propertyid) continue;
 
         const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
@@ -48,20 +53,20 @@ function parseXmlProperties(xmlString) {
         const beds = parseInt(getTagValue('Bedrooms')) || parseInt(getTagValue('Beds')) || 0;
         const baths = parseInt(getTagValue('Bathrooms')) || parseInt(getTagValue('Baths')) || 0;
         const sqm = parseFloat(getTagValue('Built')) || parseFloat(getTagValue('sqm')) || 0;
-        const propertyType = getTagValue('Type') || 'Property';
+        const propertyType = getTagValue('Type') || getTagValue('PropertyType') || 'Property';
         const description = getTagValue('Description') || getTagValue('Desc') || '';
 
         let images = [];
-        const picturesMatch = block.match(/<Pictures[^>]*>([\s\S]*?)<\/Pictures>/i) || block.match(/<images[^>]*>([\s\S]*?)<\/images>/i);
+        const picturesMatch = block.match(/<(?:Pictures|images|Pictures_List)[^>]*>([\s\S]*?)<\/(?:Pictures|images|Pictures_List)>/i);
         if (picturesMatch) {
-            const urlMatches = picturesMatch[1].match(/<Url[^>]*>([^<]*)<\/Url>/gi) || picturesMatch[1].match(/<url[^>]*>([^<]*)<\/url>/gi);
+            const urlMatches = picturesMatch[1].match(/<(?:Url|url)[^>]*>([^<]*)<\/(?:Url|url)>/gi);
             if (urlMatches) {
                 images = urlMatches.map(m => m.replace(/<\/?(?:Url|url)[^>]*>/gi, '').trim());
             }
         }
 
         if (images.length === 0) {
-            const urlMatches = block.match(/<Url[^>]*>([^<]*)<\/Url>/gi) || block.match(/<url[^>]*>([^<]*)<\/url>/gi);
+            const urlMatches = block.match(/<(?:Url|url)[^>]*>([^<]*)<\/(?:Url|url)>/gi);
             if (urlMatches) {
                 images = urlMatches.map(m => m.replace(/<\/?(?:Url|url)[^>]*>/gi, '').trim());
             }
@@ -89,23 +94,40 @@ function parseXmlProperties(xmlString) {
     return properties;
 }
 
-async function fetchXmlFromSpain() {
-    const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
-    
-    const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/xml, text/xml, */*'
-        }
+function fetchRawXmlFromSpain() {
+    return new Promise((resolve, reject) => {
+        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
+        
+        https.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept-Encoding': 'gzip, deflate',
+                'Accept': '*/*'
+            }
+        }, (res) => {
+            if (res.statusCode !== 200) {
+                return reject(new Error(`Estatus HTTP de España: ${res.statusCode}`));
+            }
+
+            let stream = res;
+            const encoding = res.headers['content-encoding'];
+
+            if (encoding === 'gzip') {
+                stream = res.pipe(zlib.createGunzip());
+            } else if (encoding === 'deflate') {
+                stream = res.pipe(zlib.createInflate());
+            }
+
+            let chunks = [];
+            stream.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            stream.on('end', () => {
+                const buffer = Buffer.concat(chunks);
+                const xmlText = buffer.toString('utf8');
+                resolve(xmlText);
+            });
+            stream.on('error', (err) => reject(err));
+        }).on('error', (err) => reject(err));
     });
-
-    if (!response.ok) {
-        throw new Error(`Resales Online respondió con estatus HTTP ${response.status}`);
-    }
-
-    const xmlText = await response.text();
-    return parseXmlProperties(xmlText);
 }
 
 app.get('/api/properties', async (req, res) => {
@@ -117,10 +139,11 @@ app.get('/api/properties', async (req, res) => {
         const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
 
         if (!cachedProperties || isCacheExpired || forceRefresh) {
-            console.log("Iniciando descarga y descompresión nativa del XML masivo en Render...");
-            cachedProperties = await fetchXmlFromSpain();
+            console.log("Descargando y descomprimiendo buffer de España...");
+            const rawXml = await fetchRawXmlFromSpain();
+            lastXmlPreview = rawXml.substring(0, 800);
+            cachedProperties = parseXmlProperties(rawXml);
             lastCachedTime = Date.now();
-            console.log(`Descarga y parseo finalizado. Registros en memoria: ${cachedProperties.length}`);
         }
 
         const startIndex = (page - 1) * limit;
@@ -133,10 +156,11 @@ app.get('/api/properties', async (req, res) => {
             total: cachedProperties.length,
             page,
             limit,
-            hasMore: endIndex < cachedProperties.length
+            hasMore: endIndex < cachedProperties.length,
+            debugPreview: cachedProperties.length === 0 ? lastXmlPreview : undefined
         });
     } catch (error) {
-        console.error("Error procesando el catálogo de España:", error);
+        console.error("Error procesando el catálogo:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });

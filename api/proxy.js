@@ -1,73 +1,58 @@
-import https from 'https';
-
-export default function handler(req, res) {
+// api/proxy.js - Vercel Serverless Function (Node 18+ Native Fetch + Decompression)
+export default async function handler(req, res) {
+    // 1. Configuración de Cabeceras CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Date, X-Api-Version');
 
     if (req.method === 'OPTIONS') {
         res.status(200).end();
         return;
     }
 
-    const requestedPage = parseInt(req.query.page || '1', 10);
-    const pageSize = parseInt(req.query.limit || '200', 10);
+    try {
+        // 2. Extraer parámetros de paginación
+        const pageNo = req.query.page || req.query.p_PageNo || req.query.P_PageNo || '1';
+        const pageSize = req.query.limit || req.query.p_PageSize || req.query.P_PageSize || '200';
 
-    const hostname = "xmlout.resales-online.com";
-    const path = "/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
+        // 3. Endpoint Oficial Resales Online V3 (Modo Producción Paginado)
+        const targetUrl = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_PageNo=${pageNo}&P_PageSize=${pageSize}`;
 
-    const options = {
-        hostname: hostname,
-        port: 443,
-        path: path,
-        method: 'GET',
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/xml, text/xml, */*'
-        },
-        timeout: 55000
-    };
+        // 4. Consumo nativo mediante Fetch (Descompresión gzip automática)
+        const response = await fetch(targetUrl, {
+            method: 'GET',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/xml, text/xml, */*'
+            }
+        });
 
-    return new Promise((resolve) => {
-        const httpsReq = https.request(options, (httpsRes) => {
-            let xmlData = '';
-            httpsRes.setEncoding('utf8');
-
-            httpsRes.on('data', (chunk) => { xmlData += chunk; });
-            
-            httpsRes.on('end', () => {
-                try {
-                    const properties = parseXmlToJSON(xmlData);
-                    
-                    // Paginación interna de alto rendimiento en Vercel
-                    const startIndex = (requestedPage - 1) * pageSize;
-                    const endIndex = startIndex + pageSize;
-                    const paginatedItems = properties.slice(startIndex, endIndex);
-
-                    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-                    res.status(200).json({
-                        success: true,
-                        page: requestedPage,
-                        pageSize: pageSize,
-                        totalProperties: properties.length,
-                        totalPages: Math.ceil(properties.length / pageSize),
-                        hasMore: endIndex < properties.length,
-                        items: paginatedItems
-                    });
-                } catch (err) {
-                    res.status(500).json({ success: false, error: "Error al parsear el feed: " + err.message });
-                }
-                resolve();
+        if (!response.ok) {
+            return res.status(response.status).json({
+                success: false,
+                error: `Servidor de España devolvió estatus HTTP ${response.status}`
             });
+        }
+
+        const xmlData = await response.text();
+        const properties = parseXmlToJSON(xmlData);
+
+        // 5. Retorno limpio en JSON a Wix Studio
+        return res.status(200).json({
+            success: true,
+            page: parseInt(pageNo, 10),
+            pageSize: parseInt(pageSize, 10),
+            itemsCount: properties.length,
+            hasMore: properties.length >= parseInt(pageSize, 10),
+            items: properties
         });
 
-        httpsReq.on('error', (error) => {
-            res.status(500).json({ success: false, error: "Error en la tubería del Feed: " + error.message });
-            resolve();
+    } catch (error) {
+        return res.status(500).json({
+            success: false,
+            error: "Error en el pipeline de Vercel: " + error.message
         });
-
-        httpsReq.end();
-    });
+    }
 }
 
 function parseXmlToJSON(xmlString) {

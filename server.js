@@ -5,7 +5,6 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Permisos CORS para comunicación segura con Wix Studio
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -23,7 +22,6 @@ function parseXmlProperties(xmlString) {
     const properties = [];
     if (!xmlString || typeof xmlString !== 'string') return properties;
 
-    // Normalizar etiquetas para soportar variaciones del Feed V3
     let cleanXml = xmlString;
     cleanXml = cleanXml.replace(/<(?:Property|property|PropertyDetails|property_details)\b/gi, '<Property');
     cleanXml = cleanXml.replace(/<\/(?:Property|property|PropertyDetails|property_details)>/gi, '</Property>');
@@ -94,10 +92,8 @@ function parseXmlProperties(xmlString) {
     return properties;
 }
 
-function fetchRawXmlFromSpain() {
+function fetchXmlUrl(url) {
     return new Promise((resolve, reject) => {
-        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
-        
         https.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -122,12 +118,34 @@ function fetchRawXmlFromSpain() {
             stream.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
             stream.on('end', () => {
                 const buffer = Buffer.concat(chunks);
-                const xmlText = buffer.toString('utf8');
-                resolve(xmlText);
+                resolve(buffer.toString('utf8'));
             });
             stream.on('error', (err) => reject(err));
         }).on('error', (err) => reject(err));
     });
+}
+
+async function fetchXmlFromSpain() {
+    // 1. Intento con URL Principal de Producción
+    const mainUrl = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
+    let xmlText = await fetchXmlUrl(mainUrl);
+    let items = parseXmlProperties(xmlText);
+
+    // 2. Si el feed principal viene vacío, intentar con el flag de Sandbox
+    if (items.length === 0) {
+        console.log("Feed principal vacío. Probando modo Sandbox...");
+        const sandboxUrl = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Sandbox=true";
+        const sandboxXml = await fetchXmlUrl(sandboxUrl);
+        const sandboxItems = parseXmlProperties(sandboxXml);
+
+        if (sandboxItems.length > 0) {
+            xmlText = sandboxXml;
+            items = sandboxItems;
+        }
+    }
+
+    lastXmlPreview = xmlText.substring(0, 800);
+    return { items, rawXml: xmlText };
 }
 
 app.get('/api/properties', async (req, res) => {
@@ -139,10 +157,9 @@ app.get('/api/properties', async (req, res) => {
         const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
 
         if (!cachedProperties || isCacheExpired || forceRefresh) {
-            console.log("Descargando y descomprimiendo buffer de España...");
-            const rawXml = await fetchRawXmlFromSpain();
-            lastXmlPreview = rawXml.substring(0, 800);
-            cachedProperties = parseXmlProperties(rawXml);
+            console.log("Consultando servidor de Resales Online...");
+            const { items } = await fetchXmlFromSpain();
+            cachedProperties = items;
             lastCachedTime = Date.now();
         }
 

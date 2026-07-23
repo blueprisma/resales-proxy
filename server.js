@@ -15,7 +15,7 @@ app.use((req, res, next) => {
 let cachedProperties = [];
 let lastCachedTime = 0;
 let isSyncing = false;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas en memoria RAM
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas en RAM
 
 function parsePropertiesFromXml(xmlString) {
     const properties = [];
@@ -90,7 +90,6 @@ function parsePropertiesFromXml(xmlString) {
 
 function fetchBatch(p1 = 1, p2 = 500) {
     return new Promise((resolve, reject) => {
-        // INYECCIÓN CRÍTICA: P_Inc=0 desactiva el modo incremental y fuerza la entrega del CATÁLOGO COMPLETO
         const url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&n=500&p1=${p1}&p2=${p2}&P_Inc=0`;
 
         https.get(url, {
@@ -113,10 +112,10 @@ function fetchBatch(p1 = 1, p2 = 500) {
 }
 
 async function downloadAllPropertiesInBatches() {
-    if (isSyncing) return cachedProperties;
+    if (isSyncing) return;
     isSyncing = true;
 
-    console.log("[Proxy] Forzando descarga del catálogo COMPLETO (P_Inc=0)...");
+    console.log("[Proxy] Iniciando Carga Progresiva Instantánea (P_Inc=0)...");
     let allItems = [];
     let p1 = 1;
     let p2 = 500;
@@ -129,7 +128,7 @@ async function downloadAllPropertiesInBatches() {
             const xmlData = await fetchBatch(p1, p2);
 
             if (xmlData.includes('previous instance') || xmlData.includes('Please wait')) {
-                console.warn("[Proxy] Enfriamiento en servidor de España.");
+                console.warn("[Proxy] Enfriamiento detectado en España.");
                 break;
             }
 
@@ -139,9 +138,12 @@ async function downloadAllPropertiesInBatches() {
                 hasMore = false;
             } else {
                 allItems = allItems.concat(parsedBatch);
+                // CLAVE TÉCNICA: Publicamos el lote en RAM INMEDIATAMENTE para responder al usuario sin demoras
+                cachedProperties = [...allItems];
+                lastCachedTime = Date.now();
                 p1 += 500;
                 p2 += 500;
-                await new Promise(r => setTimeout(r, 300));
+                await new Promise(r => setTimeout(r, 200));
             }
         } catch (err) {
             console.error(`[Proxy] Error en lote ${p1}-${p2}:`, err.message);
@@ -149,14 +151,7 @@ async function downloadAllPropertiesInBatches() {
         }
     }
 
-    if (allItems.length > 0) {
-        cachedProperties = allItems;
-        lastCachedTime = Date.now();
-        console.log(`[Proxy] Proceso completado. Total inmuebles en memoria RAM: ${cachedProperties.length}`);
-    }
-
     isSyncing = false;
-    return cachedProperties;
 }
 
 app.get('/api/properties', async (req, res) => {
@@ -167,15 +162,27 @@ app.get('/api/properties', async (req, res) => {
     try {
         const isExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
 
-        if (cachedProperties.length === 0 || isExpired || forceRefresh) {
+        if (forceRefresh) {
+            cachedProperties = [];
+            lastCachedTime = 0;
+        }
+
+        if (cachedProperties.length === 0 || isExpired) {
             if (!isSyncing) {
                 downloadAllPropertiesInBatches();
+            }
+
+            // Aguardamos máximo 3 segundos para servir AL MENOS el primer bloque de 500 propiedades
+            let waitCount = 0;
+            while (cachedProperties.length === 0 && waitCount < 6) {
+                await new Promise(r => setTimeout(r, 500));
+                waitCount++;
             }
 
             if (cachedProperties.length === 0) {
                 return res.json({
                     status: "processing",
-                    message: "Descargando catálogo COMPLETO sin filtro incremental. Recarga en 30 segundos.",
+                    message: "Iniciando descarga inicial con España. Recarga en 5 segundos.",
                     total: 0,
                     properties: []
                 });
@@ -188,6 +195,7 @@ app.get('/api/properties', async (req, res) => {
 
         res.json({
             status: "success",
+            isSyncing,
             properties: paginatedItems,
             total: cachedProperties.length,
             page,

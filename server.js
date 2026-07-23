@@ -4,31 +4,37 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Variables de caché persistente en memoria RAM
-let cachedProperties = [];
+// La caché se inicializa en null de manera estricta para evitar la contaminación con arrays vacíos []
+let cachedProperties = null;
 let lastCachedTime = 0;
-let isFetching = false; // Bandera para evitar llamadas duplicadas
-const CACHE_DURATION = 3 * 60 * 60 * 1000; // Recarga en segundo plano cada 3 Horas
-const MIN_VALID_CATALOG_SIZE = 15;
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas
+const MIN_VALID_CATALOG_SIZE = 30; // Bloqueo si el lote degradado es menor a 30
 
+// Middleware de CORS completo
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
     next();
 });
 
 app.use(express.json());
 
+// Saneamiento de textos con prioridad en traducción al español <es>
 function getCleanTagValue(block, tag) {
     const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
     const match = block.match(regex);
     if (!match) return '';
     
     const innerContent = match[1].trim();
+
     const esMatch = innerContent.match(/<es[^>]*>([\s\S]*?)<\/es>/i);
-    if (esMatch) return esMatch[1].trim();
+    if (esMatch) {
+        return esMatch[1].trim();
+    }
 
     if (innerContent.includes('<') && innerContent.includes('>')) {
         return innerContent.replace(/<[^>]*>/g, '').trim();
@@ -37,6 +43,7 @@ function getCleanTagValue(block, tag) {
     return innerContent;
 }
 
+// Procesador individual para cada propiedad
 function parseSingleProperty(block) {
     const propertyid = getCleanTagValue(block, 'id') || getCleanTagValue(block, 'Reference') || getCleanTagValue(block, 'PropertyRefNo') || '';
     if (!propertyid) return null;
@@ -100,18 +107,23 @@ async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0&n=1000&i=True";
         
-        const req = https.get(url, { timeout: 35000 }, (res) => {
+        const req = https.get(url, { timeout: 25000 }, (res) => {
             if (res.statusCode !== 200) {
-                return reject(new Error(`API respondió HTTP: ${res.statusCode}`));
+                reject(new Error(`API de origen respondió HTTP: ${res.statusCode}`));
+                return;
             }
 
             let data = '';
             res.setEncoding('utf8');
-            res.on('data', chunk => data += chunk);
+            res.on('data', (chunk) => { data += chunk; });
 
             res.on('end', () => {
-                if (data.includes('previous instance') || data.includes('Please wait') || data.includes('running')) {
-                    return reject(new Error("RESALES_CONCURRENCY_LOCK"));
+                const hasLockMessage = data.includes('previous instance') || 
+                                       data.includes('Please wait') || 
+                                       data.includes('running');
+                if (hasLockMessage) {
+                    reject(new Error("RESALES_CONCURRENCY_LOCK"));
+                    return;
                 }
 
                 let startTag = '';
@@ -123,7 +135,8 @@ async function fetchAndParseXml() {
                     endTag = startTag.replace('<', '</');
                 } else {
                     const err = new Error("NO_PROPERTY_TAGS_FOUND");
-                    return reject(err);
+                    reject(err);
+                    return;
                 }
 
                 const properties = [];
@@ -136,10 +149,15 @@ async function fetchAndParseXml() {
                     if (parsed) properties.push(parsed);
                 }
 
+                if (properties.length === 0) {
+                    reject(new Error("PARSED_ZERO_PROPERTIES"));
+                    return;
+                }
+
                 resolve(properties);
             });
 
-            res.on('error', err => reject(err));
+            res.on('error', (err) => reject(err));
         });
 
         req.on('timeout', () => {
@@ -147,40 +165,52 @@ async function fetchAndParseXml() {
             reject(new Error("RESALES_CONNECTION_TIMEOUT"));
         });
 
-        req.on('error', err => reject(err));
+        req.on('error', (err) => reject(err));
     });
 }
 
-// Tarea automatizada en segundo plano (Background Worker)
-async function updateCacheInBackground() {
-    if (isFetching) return;
-    isFetching = true;
-    console.log("[Proxy Worker] Iniciando descarga asíncrona de datos desde España...");
-
-    try {
-        const fetchedData = await fetchAndParseXml();
-        if (fetchedData.length >= MIN_VALID_CATALOG_SIZE) {
-            cachedProperties = fetchedData;
-            lastCachedTime = Date.now();
-            console.log(`[Proxy Worker SUCCESS] Caché renovada en segundo plano: ${cachedProperties.length} propiedades.`);
-        } else {
-            console.warn(`[Proxy Worker GUARD] Lote insuficiente de España (${fetchedData.length} ítems). Reteniendo inventario anterior.`);
-        }
-    } catch (error) {
-        console.warn("[Proxy Worker WARN] La descarga remota en segundo plano falló:", error.message);
-    } finally {
-        isFetching = false;
-    }
-}
-
-// Endpoint de ultra-alta velocidad para Wix Studio (< 50ms response)
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
+    const forceRefresh = req.query.refresh === 'true';
 
-    // Si la caché está totalmente vacía (primer arranque), forzamos una hidratación rápida
-    if (cachedProperties.length === 0 && !isFetching) {
-        await updateCacheInBackground();
+    const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
+    let remoteCooldownActive = false;
+    let warningMessage = null;
+
+    if (!cachedProperties || cachedProperties.length === 0 || isCacheExpired || forceRefresh) {
+        console.log("[Proxy] Solicitando actualización de datos a España...");
+        try {
+            const fetchedData = await fetchAndParseXml();
+            
+            if (cachedProperties && cachedProperties.length >= MIN_VALID_CATALOG_SIZE && fetchedData.length < MIN_VALID_CATALOG_SIZE) {
+                remoteCooldownActive = true;
+                warningMessage = `Lote externo degradado (${fetchedData.length} propiedades). Se retiene el catálogo saludable de ${cachedProperties.length} propiedades en RAM.`;
+            } else {
+                cachedProperties = fetchedData;
+                lastCachedTime = Date.now();
+                console.log(`[Proxy] Caché de RAM actualizada con éxito: ${cachedProperties.length} inmuebles.`);
+            }
+        } catch (error) {
+            console.warn("[Proxy] La llamada remota falló:", error.message);
+            remoteCooldownActive = true;
+            warningMessage = error.message;
+
+            if (!cachedProperties || cachedProperties.length === 0) {
+                return res.status(503).json({
+                    status: "cooling_down",
+                    properties: [],
+                    total: 0,
+                    page,
+                    limit,
+                    hasMore: false,
+                    cachedAt: null,
+                    remote_cooldown: true,
+                    note: "El servidor proxy está en período de enfriamiento. Reintentando automáticamente...",
+                    warning: error.message
+                });
+            }
+        }
     }
 
     const startIndex = (page - 1) * limit;
@@ -188,21 +218,19 @@ app.get('/api/properties', async (req, res) => {
     const paginatedItems = cachedProperties.slice(startIndex, endIndex);
 
     res.json({
-        status: "success",
+        status: remoteCooldownActive ? "ready" : "success",
         properties: paginatedItems,
         total: cachedProperties.length,
         page,
         limit,
         hasMore: endIndex < cachedProperties.length,
         cachedAt: lastCachedTime > 0 ? new Date(lastCachedTime).toISOString() : null,
-        note: "Respuesta instantánea servida desde RAM protegida."
+        remote_cooldown: remoteCooldownActive,
+        note: "Sincronización de caché activa y saludable.",
+        warning: warningMessage
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`[Proxy] Servidor listo en puerto ${PORT}`);
-    // Ejecuta la primera descarga en segundo plano al arrancar el servidor
-    updateCacheInBackground();
-    // Programa refresco automático cada 3 horas
-    setInterval(updateCacheInBackground, CACHE_DURATION);
+    console.log(`[Proxy] Servidor corriendo en el puerto ${PORT}`);
 });

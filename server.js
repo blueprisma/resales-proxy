@@ -1,4 +1,4 @@
-çimport express from 'express';
+import express from 'express';
 import https from 'https';
 
 const app = express();
@@ -11,16 +11,9 @@ let cachedPropertiesMap = new Map();
 let lastCachedTime = 0;
 let isSyncing = false;
 let hasPerformedCleanLoad = false;
+let lastStatusText = "Servidor listo. Esperando primera consulta.";
 
-let syncProgress = {
-    inProgress: false,
-    pagesFetched: 0,
-    propertiesDownloadedThisCycle: 0,
-    lastStatusMessage: "Iniciando consulta..."
-};
-
-const CLEAN_LOAD_PAGE_SIZE = 50;  
-const MAX_PAGES_PER_SYNC = 400;   
+const PAGE_SIZE = 100;
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -101,13 +94,13 @@ function parseSingleProperty(block) {
 
 function fetchXmlPage(shouldSendI) {
     return new Promise((resolve, reject) => {
-        let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${CLEAN_LOAD_PAGE_SIZE}`;
+        let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${PAGE_SIZE}`;
         if (shouldSendI) {
             url += '&I=TRUE';
         }
 
         const options = {
-            timeout: 30000,
+            timeout: 45000,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
             }
@@ -125,7 +118,7 @@ function fetchXmlPage(shouldSendI) {
             res.on('end', () => {
                 const lowerData = data.toLowerCase();
                 if (lowerData.includes('previous instance') || lowerData.includes('please wait') || lowerData.includes('running')) {
-                    return resolve({ status: 'WAIT_FOR_GENERATION', properties: [] });
+                    return resolve({ status: 'WAIT', properties: [] });
                 }
 
                 let startTag = '';
@@ -156,110 +149,62 @@ function fetchXmlPage(shouldSendI) {
 
         req.on('timeout', () => {
             req.destroy();
-            reject(new Error("TIMEOUT_SINGLE_PAGE"));
+            reject(new Error("TIMEOUT_CONNECTING_TO_SPAIN"));
         });
 
         req.on('error', err => reject(err));
     });
 }
 
-async function runSyncCycle() {
+async function executeSingleFetch() {
     if (isSyncing) return;
     isSyncing = true;
 
-    const isThisACleanLoad = !hasPerformedCleanLoad;
-    let needToSendI = isThisACleanLoad; // Flag de un solo uso para I=TRUE
-
-    syncProgress = {
-        inProgress: true,
-        pagesFetched: 0,
-        propertiesDownloadedThisCycle: 0,
-        lastStatusMessage: "Iniciando consulta..."
-    };
-
-    console.log(`[Proxy Worker] Iniciando descarga (${isThisACleanLoad ? 'Clean Load' : 'Incremental'}), lote size: ${CLEAN_LOAD_PAGE_SIZE}...`);
+    const isClean = !hasPerformedCleanLoad;
+    lastStatusText = `Conectando con España (${isClean ? 'Clean Load' : 'Incremental'})...`;
 
     try {
-        let pageCount = 0;
-        let totalReceived = 0;
-        let keepFetching = true;
+        let result = await fetchXmlPage(isClean);
 
-        while (keepFetching && pageCount < MAX_PAGES_PER_SYNC) {
-            const shouldSendI = needToSendI;
-            
-            const result = await fetchXmlPage(shouldSendI);
+        if (result.status === 'WAIT') {
+            lastStatusText = "España está procesando la solicitud. Esperando 20 segundos de silencio...";
+            await wait(20000);
+            result = await fetchXmlPage(false); // Segundo intento sin I=TRUE
+        }
 
-            // Desactivamos I=TRUE inmediatamente para los siguientes intentos/páginas
-            needToSendI = false;
+        const properties = result.properties || [];
 
-            if (result.status === 'WAIT_FOR_GENERATION') {
-                console.log("[Proxy Worker] España está generando el feed. Esperando 10 segundos antes de consultar el lote listo...");
-                syncProgress.lastStatusMessage = "España está procesando el catálogo. Reintentando lectura en 10 segundos...";
-                await wait(10000);
-                continue; // Reintenta llamar a la API SIN I=TRUE
-            }
-
-            const properties = result.properties || [];
-            pageCount++;
-            syncProgress.pagesFetched = pageCount;
-
-            if (properties.length === 0) {
-                console.log(`[Proxy Worker] Micro-lote ${pageCount} devolvió 0 registros. Fin de catálogo.`);
-                keepFetching = false;
-                break;
-            }
-
+        if (properties.length > 0) {
             for (const p of properties) {
                 cachedPropertiesMap.set(p._id, p);
             }
-
-            totalReceived += properties.length;
-            syncProgress.propertiesDownloadedThisCycle = totalReceived;
-            syncProgress.lastStatusMessage = `Descargadas ${cachedPropertiesMap.size} propiedades de España (Lote ${pageCount} completado)...`;
-
-            console.log(`[Proxy Worker] Lote ${pageCount}: +${properties.length} (Total acumulado en RAM: ${cachedPropertiesMap.size}).`);
-
-            if (properties.length < CLEAN_LOAD_PAGE_SIZE) {
-                keepFetching = false;
-            } else {
-                await wait(300);
-            }
-        }
-
-        if (isThisACleanLoad && totalReceived > 0) {
             hasPerformedCleanLoad = true;
-        }
-
-        if (cachedPropertiesMap.size > 0) {
             lastCachedTime = Date.now();
-            syncProgress.lastStatusMessage = "Sincronizado con éxito";
+            lastStatusText = "Sincronización exitosa.";
+        } else {
+            lastStatusText = "España respondió con 0 propiedades o aún empaquetando.";
         }
 
     } catch (err) {
-        console.warn("[Proxy Worker WARN] Excepción en ciclo:", err.message);
-        syncProgress.lastStatusMessage = err.message;
+        console.warn("[Proxy Error]:", err.message);
+        lastStatusText = `Error: ${err.message}`;
     } finally {
         isSyncing = false;
-        syncProgress.inProgress = false;
     }
 }
 
-setInterval(() => {
-    if (cachedPropertiesMap.size === 0 && !isSyncing) {
-        runSyncCycle();
-    }
-}, 15000);
-
-setTimeout(runSyncCycle, 2000);
-
-app.get('/api/properties', (req, res) => {
+app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
+
+    // Si la RAM está vacía y no hay proceso corriendo, dispara UNA SOLA llamada limpia
+    if (cachedPropertiesMap.size === 0 && !isSyncing) {
+        executeSingleFetch();
+    }
+
     const allItems = Array.from(cachedPropertiesMap.values());
 
     if (allItems.length === 0) {
-        if (!isSyncing) runSyncCycle();
-
         return res.status(200).json({
             status: "cooling_down",
             properties: [],
@@ -268,7 +213,7 @@ app.get('/api/properties', (req, res) => {
             limit,
             hasMore: false,
             cachedAt: null,
-            note: syncProgress.lastStatusMessage
+            note: lastStatusText
         });
     }
 
@@ -284,7 +229,7 @@ app.get('/api/properties', (req, res) => {
         limit,
         hasMore: endIndex < allItems.length,
         cachedAt: new Date(lastCachedTime).toISOString(),
-        note: "Datos servidos desde memoria RAM protegida."
+        note: "Servido desde RAM protegida."
     });
 });
 

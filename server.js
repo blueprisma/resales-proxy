@@ -40,12 +40,9 @@ function parsePropertiesFromXml(xmlString) {
         if (!propertyid) continue;
 
         const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
-        
-        // Mapeo preciso de PUEBLOS (Jávea, Dénia, Calpe, Altea, Moraira...)
         const pueblo = getTagValue('Town') || getTagValue('City') || getTagValue('Municipality');
         const urbanizacion = getTagValue('Location') || getTagValue('Urbanisation');
         const areaMacro = getTagValue('Area') || 'Costa Blanca';
-
         const location = pueblo || urbanizacion || areaMacro;
 
         const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
@@ -92,11 +89,12 @@ function fetchBatch(p1 = 1, p2 = 500) {
     return new Promise((resolve, reject) => {
         const url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&n=500&p1=${p1}&p2=${p2}&P_Inc=0`;
 
-        https.get(url, {
+        const req = https.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                 'Accept': '*/*'
-            }
+            },
+            timeout: 10000 // 10 segundos máximo por llamada
         }, (res) => {
             if (res.statusCode !== 200) {
                 return reject(new Error(`Estatus HTTP España: ${res.statusCode}`));
@@ -107,7 +105,13 @@ function fetchBatch(p1 = 1, p2 = 500) {
             res.on('data', chunk => data += chunk);
             res.on('end', () => resolve(data));
             res.on('error', err => reject(err));
-        }).on('error', err => reject(err));
+        });
+
+        req.on('error', err => reject(err));
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Timeout en servidor de España'));
+        });
     });
 }
 
@@ -115,43 +119,45 @@ async function downloadAllPropertiesInBatches() {
     if (isSyncing) return;
     isSyncing = true;
 
-    console.log("[Proxy] Iniciando Carga Progresiva Instantánea (P_Inc=0)...");
+    console.log("[Proxy] Descargando catálogo por lotes...");
     let allItems = [];
     let p1 = 1;
     let p2 = 500;
     let hasMore = true;
     let consecutiveErrors = 0;
 
-    while (hasMore && consecutiveErrors < 3) {
-        try {
-            console.log(`[Proxy] Descargando lote ${p1} a ${p2}...`);
-            const xmlData = await fetchBatch(p1, p2);
+    try {
+        while (hasMore && consecutiveErrors < 3) {
+            try {
+                console.log(`[Proxy] Descargando lote ${p1} a ${p2}...`);
+                const xmlData = await fetchBatch(p1, p2);
 
-            if (xmlData.includes('previous instance') || xmlData.includes('Please wait')) {
-                console.warn("[Proxy] Enfriamiento detectado en España.");
-                break;
+                if (xmlData.includes('previous instance') || xmlData.includes('Please wait')) {
+                    console.warn("[Proxy] Servidor requiere enfriamiento.");
+                    break;
+                }
+
+                const parsedBatch = parsePropertiesFromXml(xmlData);
+
+                if (parsedBatch.length === 0) {
+                    hasMore = false;
+                } else {
+                    allItems = allItems.concat(parsedBatch);
+                    cachedProperties = [...allItems];
+                    lastCachedTime = Date.now();
+                    p1 += 500;
+                    p2 += 500;
+                    await new Promise(r => setTimeout(r, 200));
+                }
+            } catch (err) {
+                console.error(`[Proxy] Error en lote ${p1}-${p2}:`, err.message);
+                consecutiveErrors++;
             }
-
-            const parsedBatch = parsePropertiesFromXml(xmlData);
-
-            if (parsedBatch.length === 0) {
-                hasMore = false;
-            } else {
-                allItems = allItems.concat(parsedBatch);
-                // CLAVE TÉCNICA: Publicamos el lote en RAM INMEDIATAMENTE para responder al usuario sin demoras
-                cachedProperties = [...allItems];
-                lastCachedTime = Date.now();
-                p1 += 500;
-                p2 += 500;
-                await new Promise(r => setTimeout(r, 200));
-            }
-        } catch (err) {
-            console.error(`[Proxy] Error en lote ${p1}-${p2}:`, err.message);
-            consecutiveErrors++;
         }
+    } finally {
+        // LIBERACIÓN GARANTIZADA DEL CANDADO
+        isSyncing = false;
     }
-
-    isSyncing = false;
 }
 
 app.get('/api/properties', async (req, res) => {
@@ -165,6 +171,7 @@ app.get('/api/properties', async (req, res) => {
         if (forceRefresh) {
             cachedProperties = [];
             lastCachedTime = 0;
+            isSyncing = false; // Reset forzado
         }
 
         if (cachedProperties.length === 0 || isExpired) {
@@ -172,9 +179,8 @@ app.get('/api/properties', async (req, res) => {
                 downloadAllPropertiesInBatches();
             }
 
-            // Aguardamos máximo 3 segundos para servir AL MENOS el primer bloque de 500 propiedades
             let waitCount = 0;
-            while (cachedProperties.length === 0 && waitCount < 6) {
+            while (cachedProperties.length === 0 && waitCount < 16) {
                 await new Promise(r => setTimeout(r, 500));
                 waitCount++;
             }
@@ -182,7 +188,7 @@ app.get('/api/properties', async (req, res) => {
             if (cachedProperties.length === 0) {
                 return res.json({
                     status: "processing",
-                    message: "Iniciando descarga inicial con España. Recarga en 5 segundos.",
+                    message: "Descargando lotes con España. Recarga en 10 segundos.",
                     total: 0,
                     properties: []
                 });

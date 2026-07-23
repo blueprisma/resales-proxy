@@ -7,13 +7,23 @@ const PORT = process.env.PORT || 3000;
 const RESALES_USER = process.env.RESALES_USER || 'RESALES@ININMO7';
 const RESALES_PASS = process.env.RESALES_PASS || 'ZWO3WPZ7UU';
 
+// Memoria RAM protegida por clave de referencia
 let cachedPropertiesMap = new Map();
 let lastCachedTime = 0;
 let isSyncing = false;
-let lastSyncStatusMessage = "Iniciando carga limpia...";
-let cooldownUntil = 0;
+let hasPerformedCleanLoad = false;
 
-const PAGE_SIZE = 500;
+// Estado de progreso en tiempo real
+let syncProgress = {
+    inProgress: false,
+    pagesFetched: 0,
+    propertiesDownloadedThisCycle: 0,
+    lastError: null
+};
+
+const CLEAN_LOAD_PAGE_SIZE = 50;  // Micro-lotes ultra-rápidos para Clean Load
+const INCREMENTAL_PAGE_SIZE = 100; // Lotes para refresco diario
+const MAX_PAGES_PER_SYNC = 400;   // Techo de seguridad (hasta 20.000 inmuebles)
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -24,6 +34,10 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function getCleanTagValue(block, tag) {
     const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
@@ -88,15 +102,15 @@ function parseSingleProperty(block) {
     };
 }
 
-function fetchXmlPage(isCleanLoadFirstCall) {
+function fetchXmlPage(isCleanLoadFirstCall, pageSize) {
     return new Promise((resolve, reject) => {
-        let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${PAGE_SIZE}`;
+        let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${pageSize}`;
         if (isCleanLoadFirstCall) {
             url += '&I=TRUE';
         }
 
         const options = {
-            timeout: 60000,
+            timeout: 20000,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
             }
@@ -124,7 +138,7 @@ function fetchXmlPage(isCleanLoadFirstCall) {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
                 } else {
-                    return resolve([]); 
+                    return resolve([]); // Lote vacío / fin de catálogo
                 }
 
                 const properties = [];
@@ -145,37 +159,59 @@ function fetchXmlPage(isCleanLoadFirstCall) {
 
         req.on('timeout', () => {
             req.destroy();
-            reject(new Error("TIMEOUT_CONNECTING_TO_RESALES"));
+            reject(new Error("TIMEOUT_SINGLE_PAGE"));
         });
 
         req.on('error', err => reject(err));
     });
 }
 
+// Descarga una página con hasta 3 reintentos automáticos
+async function fetchOnePageWithRetry(isCleanLoadFirstCall, pageSize) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            return await fetchXmlPage(isCleanLoadFirstCall, pageSize);
+        } catch (err) {
+            lastErr = err;
+            console.warn(`[Proxy Worker] Intento ${attempt}/3 falló en micro-lote: ${err.message}`);
+            if (err.message === "RESALES_CONCURRENCY_LOCK") throw err;
+            if (attempt < 3) await wait(3000 * attempt);
+        }
+    }
+    throw lastErr || new Error("ERROR_FETCHING_MICRO_BATCH");
+}
+
 async function runSyncCycle() {
     if (isSyncing) return;
-    if (Date.now() < cooldownUntil) {
-        console.log(`[Proxy Worker] Enfriamiento activo. Esperando a que España termine su proceso.`);
-        return;
-    }
-
     isSyncing = true;
-    console.log("[Proxy Worker] Iniciando ciclo de descarga en segundo plano desde España...");
+
+    const isThisACleanLoad = !hasPerformedCleanLoad;
+    const pageSize = isThisACleanLoad ? CLEAN_LOAD_PAGE_SIZE : INCREMENTAL_PAGE_SIZE;
+
+    syncProgress = {
+        inProgress: true,
+        pagesFetched: 0,
+        propertiesDownloadedThisCycle: 0,
+        lastError: null
+    };
+
+    console.log(`[Proxy Worker] Iniciando descarga (${isThisACleanLoad ? 'Clean Load I=TRUE' : 'Incremental'}), lote size: ${pageSize}...`);
 
     try {
         let pageCount = 0;
+        let totalReceived = 0;
         let keepFetching = true;
 
-        while (keepFetching && pageCount < 30) {
-            const isFirstCall = (pageCount === 0 && cachedPropertiesMap.size === 0);
-            
-            console.log(`[Proxy Worker] Solicitando lote ${pageCount + 1} (${isFirstCall ? 'Clean Load I=TRUE' : 'N=500'})...`);
-            
-            const properties = await fetchXmlPage(isFirstCall);
+        while (keepFetching && pageCount < MAX_PAGES_PER_SYNC) {
+            const isFirstCallOfClean = (isThisACleanLoad && pageCount === 0);
+
+            const properties = await fetchOnePageWithRetry(isFirstCallOfClean, pageSize);
             pageCount++;
+            syncProgress.pagesFetched = pageCount;
 
             if (properties.length === 0) {
-                console.log(`[Proxy Worker] Lote ${pageCount} devolvió 0 propiedades. Fin de la descarga.`);
+                console.log(`[Proxy Worker] Micro-lote ${pageCount} devolvió 0 registros. Fin de catálogo.`);
                 keepFetching = false;
                 break;
             }
@@ -184,42 +220,45 @@ async function runSyncCycle() {
                 cachedPropertiesMap.set(p._id, p);
             }
 
-            console.log(`[Proxy Worker] Lote ${pageCount} recibido: ${properties.length} propiedades (Total en RAM: ${cachedPropertiesMap.size}).`);
+            totalReceived += properties.length;
+            syncProgress.propertiesDownloadedThisCycle = totalReceived;
 
-            if (properties.length < PAGE_SIZE) {
-                keepFetching = false;
+            console.log(`[Proxy Worker] Lote ${pageCount}: +${properties.length} (Total acumulado en RAM: ${cachedPropertiesMap.size}).`);
+
+            if (properties.length < pageSize) {
+                keepFetching = false; // Última página
+            } else {
+                await wait(200); // Respiro de red entre peticiones
             }
+        }
+
+        if (isThisACleanLoad && totalReceived > 0) {
+            hasPerformedCleanLoad = true;
         }
 
         if (cachedPropertiesMap.size > 0) {
             lastCachedTime = Date.now();
-            lastSyncStatusMessage = "Sincronización exitosa completa.";
-        } else {
-            lastSyncStatusMessage = "España devolvió 0 propiedades.";
+            syncProgress.lastError = "Sincronizado con éxito";
         }
 
     } catch (err) {
-        console.warn("[Proxy Worker WARN] Fallo en ciclo:", err.message);
-        lastSyncStatusMessage = err.message;
-
-        if (err.message === "RESALES_CONCURRENCY_LOCK") {
-            cooldownUntil = Date.now() + (3 * 60 * 1000);
-            lastSyncStatusMessage = "España está generando el paquete XML en su servidor. Enfriamiento de 3 minutos activado en Render.";
-        }
+        console.warn("[Proxy Worker WARN] Excepción en ciclo:", err.message);
+        syncProgress.lastError = err.message;
     } finally {
         isSyncing = false;
+        syncProgress.inProgress = false;
     }
 }
 
-// Bucle en segundo plano cada 40 segundos (no afectado por peticiones HTTP)
+// Reintento en segundo plano cada 15 segundos si la memoria RAM está vacía
 setInterval(() => {
     if (cachedPropertiesMap.size === 0 && !isSyncing) {
         runSyncCycle();
     }
-}, 40000);
+}, 15000);
 
-// Disparo inicial a los 3 segundos
-setTimeout(runSyncCycle, 3000);
+// Disparo inmediato de encendido
+setTimeout(runSyncCycle, 2000);
 
 app.get('/api/properties', (req, res) => {
     const page = parseInt(req.query.page) || 1;
@@ -227,6 +266,12 @@ app.get('/api/properties', (req, res) => {
     const allItems = Array.from(cachedPropertiesMap.values());
 
     if (allItems.length === 0) {
+        if (!isSyncing) runSyncCycle();
+        
+        const noteMsg = syncProgress.inProgress 
+            ? `Descargadas ${syncProgress.propertiesDownloadedThisCycle} propiedades de España (Micro-lote ${syncProgress.pagesFetched})...`
+            : `Preparando carga inicial desde España. Estado: ${syncProgress.lastError || 'Iniciando...'}`;
+
         return res.status(200).json({
             status: "cooling_down",
             properties: [],
@@ -235,7 +280,7 @@ app.get('/api/properties', (req, res) => {
             limit,
             hasMore: false,
             cachedAt: null,
-            note: `Procesando en segundo plano en Render. Estado actual: ${lastSyncStatusMessage}`
+            note: noteMsg
         });
     }
 
@@ -251,7 +296,7 @@ app.get('/api/properties', (req, res) => {
         limit,
         hasMore: endIndex < allItems.length,
         cachedAt: new Date(lastCachedTime).toISOString(),
-        note: "Servido desde memoria RAM protegida."
+        note: "Datos servidos desde memoria RAM protegida."
     });
 });
 

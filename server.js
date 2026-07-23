@@ -9,20 +9,32 @@ let cachedProperties = null;
 let lastCachedTime = 0;
 const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas
 
-// Parser robusto e insensible a mayúsculas/minúsculas
+// Extractor inteligente de etiquetas con soporte para sub-etiquetas anidadas (<es>, <uk>)
 function parseSingleProperty(block) {
     const getTagValue = (tag) => {
-        const regex = new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`, 'i');
+        const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
         const match = block.match(regex);
-        return match ? match[1].trim() : '';
+        if (!match) return '';
+        let val = match[1].trim();
+        
+        // Si la etiqueta contiene sub-nodos en idioma (<es> / <uk>), extrae preferentemente el español
+        if (val.includes('<')) {
+            const esMatch = val.match(/<es[^>]*>([\s\S]*?)<\/es>/i);
+            if (esMatch) return esMatch[1].trim();
+            const ukMatch = val.match(/<uk[^>]*>([\s\S]*?)<\/uk>/i);
+            if (ukMatch) return ukMatch[1].trim();
+            val = val.replace(/<[^>]+>/g, '').trim();
+        }
+        return val;
     };
 
-    const propertyid = getTagValue('Reference') || getTagValue('PropertyRefNo') || getTagValue('RefNo') || '';
+    // CORRECCIÓN CRÍTICA: Priorizamos <id> que es como responde la API V3 de España
+    const propertyid = getTagValue('id') || getTagValue('Reference') || getTagValue('PropertyRefNo') || getTagValue('RefNo') || '';
     if (!propertyid) return null;
 
     const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
     
-    // PRIORIZACIÓN DE PUEBLOS: Town (Jávea, Dénia, Calpe...) -> Area -> Location -> Costa Blanca
+    // Mapeo preferente de PUEBLOS para Zuzanna: Town (Jávea, Dénia, Calpe...) -> Area -> Location
     const location = getTagValue('Town') || getTagValue('Area') || getTagValue('Location') || 'Costa Blanca';
     
     const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
@@ -31,7 +43,7 @@ function parseSingleProperty(block) {
     const beds = parseInt(getTagValue('Bedrooms')) || parseInt(getTagValue('Beds')) || 0;
     const baths = parseInt(getTagValue('Bathrooms')) || parseInt(getTagValue('Baths')) || 0;
     const sqm = parseFloat(getTagValue('Built')) || parseFloat(getTagValue('sqm')) || 0;
-    const propertyType = getTagValue('Type') || 'Property';
+    const propertyType = getTagValue('Type') || getTagValue('Subtype') || 'Property';
     const description = getTagValue('Description') || getTagValue('Desc') || '';
 
     // Extracción limpia e insensible a mayúsculas de imágenes
@@ -70,10 +82,9 @@ function parseSingleProperty(block) {
     };
 }
 
-// Descarga en memoria forzando el modo de catálogo completo (P_Inc=0)
+// Descarga en memoria y parseo adaptativo
 async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
-        // INYECCIÓN CLAVE: P_Inc=0 desactiva la exportación incremental y resetea el puntero
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0";
         
         const req = https.get(url, { 
@@ -81,7 +92,7 @@ async function fetchAndParseXml() {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                 'Accept': '*/*'
             },
-            timeout: 18000 
+            timeout: 20000 
         }, (res) => {
             if (res.statusCode !== 200) {
                 reject(new Error(`Resales API respondió con código HTTP: ${res.statusCode}`));
@@ -96,7 +107,6 @@ async function fetchAndParseXml() {
             });
 
             res.on('end', () => {
-                // Control preventivo de bloqueos por concurrencia externa
                 const hasLockMessage = data.includes('previous instance') || 
                                        data.includes('Please wait') || 
                                        data.includes('running');
@@ -105,11 +115,11 @@ async function fetchAndParseXml() {
                     return;
                 }
 
-                // Detección dinámica de la etiqueta contenedora
+                // Detección insensible de la etiqueta contenedora
+                const tagMatch = data.match(/<(Property_Item|Property|property_item|property)>/i);
                 let startTag = '';
                 let endTag = '';
 
-                const tagMatch = data.match(/<(Property_Item|Property|property_item|property)>/i);
                 if (tagMatch) {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
@@ -121,11 +131,11 @@ async function fetchAndParseXml() {
                 }
 
                 const properties = [];
-                const propertyBlocks = data.split(startTag);
+                const propertyBlocks = data.split(new RegExp(startTag, 'i'));
                 propertyBlocks.shift();
 
                 for (let block of propertyBlocks) {
-                    const cleanBlock = block.split(endTag)[0];
+                    const cleanBlock = block.split(new RegExp(endTag, 'i'))[0];
                     const parsed = parseSingleProperty(cleanBlock);
                     if (parsed) {
                         properties.push(parsed);
@@ -154,9 +164,8 @@ async function fetchAndParseXml() {
     });
 }
 
-// Endpoint de Consulta y Paginación CORS-Compatible
+// Endpoint de Consulta con Encabezados CORS
 app.get('/api/properties', async (req, res) => {
-    // Encabezados CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -180,7 +189,6 @@ app.get('/api/properties', async (req, res) => {
             cachedProperties = fetchedData;
             lastCachedTime = Date.now();
             console.log(`[Proxy] Actualización exitosa. Registros: ${cachedProperties.length}`);
-            res.setHeader('X-Cache-Status', 'MISS');
         } catch (error) {
             console.warn("[Proxy] La llamada al proveedor falló. Causa:", error.message);
             remoteCooldownActive = true;
@@ -194,8 +202,6 @@ app.get('/api/properties', async (req, res) => {
                 cachedProperties = [];
             }
         }
-    } else {
-        res.setHeader('X-Cache-Status', 'HIT');
     }
 
     const startIndex = (page - 1) * limit;

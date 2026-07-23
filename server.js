@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 let cachedProperties = null;
 let lastCachedTime = 0;
 const CACHE_DURATION = 4 * 60 * 60 * 1000; // Caché de 4 Horas
-const MIN_VALID_CATALOG_SIZE = 30; // Ajustado a 30 para proteger contra el micro-lote de 15 propiedades
+const MIN_VALID_CATALOG_SIZE = 20; // Protege contra micro-lotes en enfriamiento
 
 // Middleware de CORS completo
 app.use((req, res, next) => {
@@ -25,19 +25,18 @@ app.use(express.json());
 
 // Saneamiento de textos con prioridad en traducción al español <es>
 function getCleanTagValue(block, tag) {
-    const regex = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i');
+    const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
     const match = block.match(regex);
     if (!match) return '';
     
     const innerContent = match[1].trim();
 
     // Priorizamos la etiqueta en español si existe traducción multilingüe
-    const esMatch = innerContent.match(/<es>([\s\S]*?)<\/es>/i);
+    const esMatch = innerContent.match(/<es[^>]*>([\s\S]*?)<\/es>/i);
     if (esMatch) {
         return esMatch[1].trim();
     }
 
-    // Si tiene otros subnodos HTML pero no es español, limpiamos etiquetas
     if (innerContent.includes('<') && innerContent.includes('>')) {
         return innerContent.replace(/<[^>]*>/g, '').trim();
     }
@@ -52,7 +51,7 @@ function parseSingleProperty(block) {
 
     const title = getCleanTagValue(block, 'title') || getCleanTagValue(block, 'type') || `Propiedad Ref: ${propertyid}`;
     
-    // Mapeo geográfico priorizando town o city sobre área o localización
+    // Mapeo geográfico priorizando town o city
     const location = getCleanTagValue(block, 'town') || 
                      getCleanTagValue(block, 'city') || 
                      getCleanTagValue(block, 'area') || 
@@ -71,19 +70,28 @@ function parseSingleProperty(block) {
     const propertyType = getCleanTagValue(block, 'type') || 'Property';
     const description = getCleanTagValue(block, 'description') || getCleanTagValue(block, 'desc') || '';
 
-    // Extracción de todas las URLs de imágenes válidas
-    const imgRegex = /https?:\/\/[^<>\s"']+\.(?:jpg|jpeg|png|webp)/gi;
-    const matchedUrls = block.match(imgRegex) || [];
+    // Extracción Universal de Imágenes (compatible con ShowFeedImage.asp y CDN dinámicos)
+    let uniqueUrls = [];
+    const picturesMatch = block.match(/<(?:pictures|images|photos)[^>]*>([\s\S]*?)<\/(?:pictures|images|photos)>/i);
+    const searchBlock = picturesMatch ? picturesMatch[1] : block;
     
-    // Deduplicación de URLs de imágenes
-    const uniqueUrls = [...new Set(matchedUrls.map(url => url.trim()))];
-    
-    // images: String separado por comas
+    const urlTagMatches = searchBlock.match(/<url[^>]*>([^<]*)<\/url>/gi);
+    if (urlTagMatches) {
+        uniqueUrls = urlTagMatches.map(m => m.replace(/<\/?url[^>]*>/gi, '').trim()).filter(u => u.length > 0);
+    } else {
+        const rawUrlMatches = searchBlock.match(/https?:\/\/[^\s"<>]+\b/gi) || [];
+        uniqueUrls = [...new Set(rawUrlMatches.map(u => u.trim()))];
+    }
+
+    // Normalización de caracteres HTML (&amp; -> &) y deduplicación
+    uniqueUrls = uniqueUrls.map(u => u.replace(/&amp;/g, '&'));
+    uniqueUrls = [...new Set(uniqueUrls)];
+
     const imagesStr = uniqueUrls.join(',');
     const mainimage = uniqueUrls.length > 0 ? uniqueUrls[0] : 'https://wixideas.wixsite.com/images/placeholder.png';
 
     return {
-        _id: propertyid, // Clave principal de Velo en Wix Studio
+        _id: propertyid,
         title,
         location,
         marketType,
@@ -102,10 +110,9 @@ function parseSingleProperty(block) {
 // Descarga en buffer y parseo dinámico con auditoría de conteo
 async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
-        // SOLUCIÓN TÉCNICA: URL con P_Inc=0, i=True (reset puntero) y n=1000 (límite de batch masivo)
+        // API V3 con i=True (reset de puntero) y n=1000 (batch masivo no truncado)
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0&n=1000&i=True";
         
-        // Timeout de conexión a 20 segundos
         const req = https.get(url, { timeout: 20000 }, (res) => {
             if (res.statusCode !== 200) {
                 reject(new Error(`API de origen respondió con estado HTTP: ${res.statusCode}`));
@@ -120,7 +127,6 @@ async function fetchAndParseXml() {
             });
 
             res.on('end', () => {
-                // Validación del bloqueo concurrente
                 const hasLockMessage = data.includes('previous instance') || 
                                        data.includes('Please wait') || 
                                        data.includes('running');
@@ -129,19 +135,18 @@ async function fetchAndParseXml() {
                     return;
                 }
 
-                // 2. AUDITORÍA DE CONTEO EN CONSOLA (Render Log)
+                // Auditoría de conteo en consola
                 const countPropertyLower = (data.match(/<property>/g) || []).length;
                 const countPropertyUpper = (data.match(/<Property>/g) || []).length;
                 const countPropertyItemLower = (data.match(/<property_item>/g) || []).length;
                 const countPropertyItemUpper = (data.match(/<Property_Item>/g) || []).length;
 
-                console.log(`[Proxy - Auditoría XML Crudo] Registros físicos detectados en el string XML de España:`);
+                console.log(`[Proxy Auditoría XML Crudo] Registros detectados en el string XML:`);
                 console.log(`  - <property>: ${countPropertyLower}`);
                 console.log(`  - <Property>: ${countPropertyUpper}`);
                 console.log(`  - <property_item>: ${countPropertyItemLower}`);
                 console.log(`  - <Property_Item>: ${countPropertyItemUpper}`);
 
-                // Detección dinámica de la etiqueta contenedora
                 let startTag = '';
                 let endTag = '';
 
@@ -149,7 +154,7 @@ async function fetchAndParseXml() {
                 if (tagMatch) {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
-                    console.log(`[Proxy] Segmentación configurada con etiqueta: ${startTag}`);
+                    console.log(`[Proxy] Segmentación activada con etiqueta: ${startTag}`);
                 } else {
                     const err = new Error("NO_PROPERTY_TAGS_FOUND");
                     err.rawXmlSnippet = data.substring(0, 1000);
@@ -158,11 +163,11 @@ async function fetchAndParseXml() {
                 }
 
                 const properties = [];
-                const propertyBlocks = data.split(startTag);
-                propertyBlocks.shift(); // Removemos cabecera XML
+                const propertyBlocks = data.split(new RegExp(startTag, 'i'));
+                propertyBlocks.shift();
 
                 for (let block of propertyBlocks) {
-                    const cleanBlock = block.split(endTag)[0];
+                    const cleanBlock = block.split(new RegExp(endTag, 'i'))[0];
                     const parsed = parseSingleProperty(cleanBlock);
                     if (parsed) {
                         properties.push(parsed);
@@ -181,9 +186,7 @@ async function fetchAndParseXml() {
                 resolve(properties);
             });
 
-            res.on('error', (err) => {
-                reject(err);
-            });
+            res.on('error', (err) => reject(err));
         });
 
         req.on('timeout', () => {
@@ -191,9 +194,7 @@ async function fetchAndParseXml() {
             reject(new Error("RESALES_CONNECTION_TIMEOUT"));
         });
 
-        req.on('error', (err) => {
-            reject(err);
-        });
+        req.on('error', (err) => reject(err));
     });
 }
 
@@ -216,9 +217,9 @@ app.get('/api/properties', async (req, res) => {
             
             // ESCUDO DE PROTECCIÓN DE CACHÉ (Cache Guard)
             if (cachedProperties && cachedProperties.length >= MIN_VALID_CATALOG_SIZE && fetchedData.length < MIN_VALID_CATALOG_SIZE) {
-                console.warn(`[Proxy] ESCUDO ACTIVO: Se bloqueó la sobreescritura de un lote degradado de ${fetchedData.length} elementos para proteger la caché saludable de ${cachedProperties.length} elementos.`);
+                console.warn(`[Proxy] ESCUDO ACTIVO: Se bloqueó la sobreescritura de un lote degradado de ${fetchedData.length} elementos para proteger la caché de ${cachedProperties.length} elementos.`);
                 remoteCooldownActive = true;
-                warningMessage = `Lote externo degradado (${fetchedData.length} propiedades recibidas). Se retiene el catálogo saludable de ${cachedProperties.length} propiedades en memoria RAM.`;
+                warningMessage = `Lote externo degradado (${fetchedData.length} propiedades recibidas). Se retiene el catálogo saludable de ${cachedProperties.length} propiedades en RAM.`;
                 res.setHeader('X-Cache-Status', 'STALE_DUE_TO_DEGRADATION');
             } else {
                 cachedProperties = fetchedData;
@@ -235,7 +236,6 @@ app.get('/api/properties', async (req, res) => {
                 rawXmlSnippet = error.rawXmlSnippet.substring(0, 500);
             }
 
-            // Inicializamos la caché vacía si es la primera ejecución absoluta y el origen falla
             if (!cachedProperties) {
                 cachedProperties = [];
             }
@@ -245,12 +245,10 @@ app.get('/api/properties', async (req, res) => {
         res.setHeader('X-Cache-Status', 'HIT');
     }
 
-    // Segmentación y paginación sobre el inventario protegido
     const startIndex = (page - 1) * limit;
     const endIndex = startIndex + limit;
     const paginatedItems = cachedProperties.slice(startIndex, endIndex);
 
-    // Auditoría si el inventario está vacío
     if (cachedProperties.length === 0) {
         noteMessage = "El XML recibido no contenía bloques de propiedades válidos.";
         if (rawXmlSnippet) {

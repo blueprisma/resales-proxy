@@ -7,13 +7,11 @@ const PORT = process.env.PORT || 3000;
 const RESALES_USER = process.env.RESALES_USER || 'RESALES@ININMO7';
 const RESALES_PASS = process.env.RESALES_PASS || 'ZWO3WPZ7UU';
 
-// Memoria RAM protegida por clave de referencia
 let cachedPropertiesMap = new Map();
 let lastCachedTime = 0;
 let isSyncing = false;
 let hasPerformedCleanLoad = false;
 
-// Estado de progreso en tiempo real
 let syncProgress = {
     inProgress: false,
     pagesFetched: 0,
@@ -21,9 +19,9 @@ let syncProgress = {
     lastError: null
 };
 
-const CLEAN_LOAD_PAGE_SIZE = 50;  // Micro-lotes ultra-rápidos para Clean Load
-const INCREMENTAL_PAGE_SIZE = 100; // Lotes para refresco diario
-const MAX_PAGES_PER_SYNC = 400;   // Techo de seguridad (hasta 20.000 inmuebles)
+const CLEAN_LOAD_PAGE_SIZE = 50;  
+const INCREMENTAL_PAGE_SIZE = 100; 
+const MAX_PAGES_PER_SYNC = 400;   
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -109,8 +107,9 @@ function fetchXmlPage(isCleanLoadFirstCall, pageSize) {
             url += '&I=TRUE';
         }
 
+        // Timeout extendido a 90 segundos para absorber la generación inicial de España
         const options = {
-            timeout: 20000,
+            timeout: 90000,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
             }
@@ -138,7 +137,7 @@ function fetchXmlPage(isCleanLoadFirstCall, pageSize) {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
                 } else {
-                    return resolve([]); // Lote vacío / fin de catálogo
+                    return resolve([]); 
                 }
 
                 const properties = [];
@@ -159,14 +158,13 @@ function fetchXmlPage(isCleanLoadFirstCall, pageSize) {
 
         req.on('timeout', () => {
             req.destroy();
-            reject(new Error("TIMEOUT_SINGLE_PAGE"));
+            reject(new Error("TIMEOUT_SINGLE_PAGE_90S"));
         });
 
         req.on('error', err => reject(err));
     });
 }
 
-// Descarga una página con hasta 3 reintentos automáticos
 async function fetchOnePageWithRetry(isCleanLoadFirstCall, pageSize) {
     let lastErr = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -176,7 +174,7 @@ async function fetchOnePageWithRetry(isCleanLoadFirstCall, pageSize) {
             lastErr = err;
             console.warn(`[Proxy Worker] Intento ${attempt}/3 falló en micro-lote: ${err.message}`);
             if (err.message === "RESALES_CONCURRENCY_LOCK") throw err;
-            if (attempt < 3) await wait(3000 * attempt);
+            if (attempt < 3) await wait(5000 * attempt);
         }
     }
     throw lastErr || new Error("ERROR_FETCHING_MICRO_BATCH");
@@ -226,9 +224,9 @@ async function runSyncCycle() {
             console.log(`[Proxy Worker] Lote ${pageCount}: +${properties.length} (Total acumulado en RAM: ${cachedPropertiesMap.size}).`);
 
             if (properties.length < pageSize) {
-                keepFetching = false; // Última página
+                keepFetching = false;
             } else {
-                await wait(200); // Respiro de red entre peticiones
+                await wait(300); 
             }
         }
 
@@ -250,15 +248,13 @@ async function runSyncCycle() {
     }
 }
 
-// Reintento en segundo plano cada 15 segundos si la memoria RAM está vacía
 setInterval(() => {
     if (cachedPropertiesMap.size === 0 && !isSyncing) {
         runSyncCycle();
     }
-}, 15000);
+}, 20000);
 
-// Disparo inmediato de encendido
-setTimeout(runSyncCycle, 2000);
+setTimeout(runSyncCycle, 3000);
 
 app.get('/api/properties', (req, res) => {
     const page = parseInt(req.query.page) || 1;

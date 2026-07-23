@@ -4,63 +4,43 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Caché interna en memoria RAM
+// Estado de memoria RAM y control de trafico
 let cachedProperties = null;
 let lastCachedTime = 0;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // Caché de 4 Horas
-const MIN_VALID_CATALOG_SIZE = 30; // Escudo contra lotes degradados
-const BACKGROUND_PULL_INTERVAL = 1 * 60 * 60 * 1000; // Actualización automática de fondo cada 1 hora
+let isFetching = false;
+let lastFetchAttempt = 0;
+const FETCH_COOLDOWN_MS = 10 * 60 * 1000; // 10 Minutos de silencio estricto para España
 
-// Middleware de CORS completo
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
+    if (req.method === 'OPTIONS') return res.status(200).end();
     next();
 });
 
 app.use(express.json());
 
-// Saneamiento de textos con prioridad en traducción al español <es>
 function getCleanTagValue(block, tag) {
     const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
     const match = block.match(regex);
     if (!match) return '';
-    
     const innerContent = match[1].trim();
-
     const esMatch = innerContent.match(/<es[^>]*>([\s\S]*?)<\/es>/i);
-    if (esMatch) {
-        return esMatch[1].trim();
-    }
-
+    if (esMatch) return esMatch[1].trim();
     if (innerContent.includes('<') && innerContent.includes('>')) {
         return innerContent.replace(/<[^>]*>/g, '').trim();
     }
-
     return innerContent;
 }
 
-// Procesador individual para cada propiedad
 function parseSingleProperty(block) {
     const propertyid = getCleanTagValue(block, 'id') || getCleanTagValue(block, 'Reference') || getCleanTagValue(block, 'PropertyRefNo') || '';
     if (!propertyid) return null;
 
     const title = getCleanTagValue(block, 'title') || getCleanTagValue(block, 'type') || `Propiedad Ref: ${propertyid}`;
-    
-    const location = getCleanTagValue(block, 'town') || 
-                     getCleanTagValue(block, 'city') || 
-                     getCleanTagValue(block, 'area') || 
-                     getCleanTagValue(block, 'location') || 
-                     'Costa Blanca';
-
-    const isNewDev = getCleanTagValue(block, 'newdevelopment') === '1' || 
-                     getCleanTagValue(block, 'newdevelopment') === 'true' || 
-                     getCleanTagValue(block, 'new_development') === '1';
-                     
+    const location = getCleanTagValue(block, 'town') || getCleanTagValue(block, 'city') || getCleanTagValue(block, 'area') || getCleanTagValue(block, 'location') || 'Costa Blanca';
+    const isNewDev = getCleanTagValue(block, 'newdevelopment') === '1' || getCleanTagValue(block, 'newdevelopment') === 'true' || getCleanTagValue(block, 'new_development') === '1';
     const marketType = isNewDev ? 'New Development' : 'Resale';
     const price = parseFloat(getCleanTagValue(block, 'price')) || 0;
     const beds = parseInt(getCleanTagValue(block, 'bedrooms')) || parseInt(getCleanTagValue(block, 'beds')) || 0;
@@ -104,43 +84,38 @@ function parseSingleProperty(block) {
     };
 }
 
-// Descarga en memoria y parseo dinámico
 async function fetchAndParseXml() {
+    if (isFetching) throw new Error("FETCH_ALREADY_IN_PROGRESS");
+    isFetching = true;
+    lastFetchAttempt = Date.now();
+
     return new Promise((resolve, reject) => {
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0&n=1000&i=True";
         
-        const req = https.get(url, { timeout: 25000 }, (res) => {
+        const req = https.get(url, { timeout: 30000 }, (res) => {
             if (res.statusCode !== 200) {
-                reject(new Error(`API de origen respondió con estado HTTP: ${res.statusCode}`));
-                return;
+                isFetching = false;
+                return reject(new Error(`API respondió HTTP ${res.statusCode}`));
             }
 
             let data = '';
             res.setEncoding('utf8');
-
-            res.on('data', (chunk) => { data += chunk; });
+            res.on('data', chunk => data += chunk);
 
             res.on('end', () => {
-                const hasLockMessage = data.includes('previous instance') || 
-                                       data.includes('Please wait') || 
-                                       data.includes('running');
-                if (hasLockMessage) {
-                    reject(new Error("RESALES_CONCURRENCY_LOCK"));
-                    return;
+                isFetching = false;
+                if (data.includes('previous instance') || data.includes('Please wait') || data.includes('running')) {
+                    return reject(new Error("RESALES_CONCURRENCY_LOCK"));
                 }
 
                 let startTag = '';
                 let endTag = '';
-
                 const tagMatch = data.match(/<(Property_Item|Property|property_item|property)>/i);
                 if (tagMatch) {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
                 } else {
-                    const err = new Error("NO_PROPERTY_TAGS_FOUND");
-                    err.rawXmlSnippet = data.substring(0, 1000);
-                    reject(err);
-                    return;
+                    return reject(new Error("NO_PROPERTY_TAGS_FOUND"));
                 }
 
                 const properties = [];
@@ -150,92 +125,64 @@ async function fetchAndParseXml() {
                 for (let block of propertyBlocks) {
                     const cleanBlock = block.split(new RegExp(endTag, 'i'))[0];
                     const parsed = parseSingleProperty(cleanBlock);
-                    if (parsed) {
-                        properties.push(parsed);
-                    }
+                    if (parsed) properties.push(parsed);
                 }
 
                 if (properties.length === 0) {
-                    const err = new Error("PARSED_ZERO_PROPERTIES");
-                    err.rawXmlSnippet = data.substring(0, 1000);
-                    reject(err);
-                    return;
+                    return reject(new Error("PARSED_ZERO_PROPERTIES"));
                 }
 
                 resolve(properties);
             });
 
-            res.on('error', (err) => reject(err));
+            res.on('error', err => {
+                isFetching = false;
+                reject(err);
+            });
         });
 
         req.on('timeout', () => {
             req.destroy();
+            isFetching = false;
             reject(new Error("RESALES_CONNECTION_TIMEOUT"));
         });
 
-        req.on('error', (err) => reject(err));
+        req.on('error', err => {
+            isFetching = false;
+            reject(err);
+        });
     });
 }
 
-// Trabajador autónomo de actualización en segundo plano
-async function backgroundWorker() {
-    console.log("[Worker] Iniciando actualización autónoma de fondo...");
+async function triggerFetchIfAllowed() {
+    const timeSinceLast = Date.now() - lastFetchAttempt;
+    if (isFetching || (lastFetchAttempt > 0 && timeSinceLast < FETCH_COOLDOWN_MS)) {
+        return; // Respeta estrictamente los 10 minutos de silencio de red
+    }
     try {
-        const fetchedData = await fetchAndParseXml();
-        
-        if (cachedProperties && cachedProperties.length >= MIN_VALID_CATALOG_SIZE && fetchedData.length < MIN_VALID_CATALOG_SIZE) {
-            console.warn(`[Worker] Escudo de Caché Activo: Se rechazó un lote degradado de ${fetchedData.length} propiedades.`);
-        } else {
-            cachedProperties = fetchedData;
+        console.log("[Proxy Worker] Ejecutando consulta controlada a España...");
+        const data = await fetchAndParseXml();
+        if (data && data.length >= 15) {
+            cachedProperties = data;
             lastCachedTime = Date.now();
-            console.log(`[Worker] Actualización completada de forma autónoma. Total en RAM: ${cachedProperties.length}`);
+            console.log(`[Proxy Worker SUCCESS] RAM cargada con ${cachedProperties.length} inmuebles.`);
         }
-    } catch (error) {
-        console.warn("[Worker] La sincronización autónoma falló (reintentará en ciclo):", error.message);
+    } catch (err) {
+        console.warn("[Proxy Worker WARN] Intento fallido. Guardando silencio de red:", err.message);
     }
 }
 
-setInterval(backgroundWorker, BACKGROUND_PULL_INTERVAL);
-setTimeout(backgroundWorker, 5000); // Disparo inicial a los 5 segundos de encendido
+// Bucle silencioso interno cada 2 minutos (solo atacará a España si han pasado los 10 min)
+setInterval(triggerFetchIfAllowed, 2 * 60 * 1000);
+setTimeout(triggerFetchIfAllowed, 3000);
 
-// Ruta API Paginada para Wix Studio con control de errores HTTP 200
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
-    const forceRefresh = req.query.refresh === 'true';
 
-    const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
-    let remoteCooldownActive = false;
-    let warningMessage = null;
-
-    if (!cachedProperties || cachedProperties.length === 0 || isCacheExpired || forceRefresh) {
-        console.log("[Proxy] Solicitando actualización de datos a Resales-Online...");
-        try {
-            const fetchedData = await fetchAndParseXml();
-            
-            if (cachedProperties && cachedProperties.length >= MIN_VALID_CATALOG_SIZE && fetchedData.length < MIN_VALID_CATALOG_SIZE) {
-                console.warn(`[Proxy] ESCUDO ACTIVO: Se bloqueó un lote degradado de ${fetchedData.length} elementos.`);
-                remoteCooldownActive = true;
-                warningMessage = `Lote externo degradado (${fetchedData.length} propiedades). Se retiene el catálogo saludable de ${cachedProperties.length} propiedades.`;
-                res.setHeader('X-Cache-Status', 'STALE_DUE_TO_DEGRADATION');
-            } else {
-                cachedProperties = fetchedData;
-                lastCachedTime = Date.now();
-                res.setHeader('X-Cache-Status', 'MISS');
-            }
-        } catch (error) {
-            console.warn("[Proxy] La llamada de red externa falló. Causa:", error.message);
-            remoteCooldownActive = true;
-            warningMessage = error.message;
-            res.setHeader('X-Cache-Status', 'STALE_DUE_TO_ERROR');
-        }
-    } else {
-        res.setHeader('X-Cache-Status', 'HIT');
-    }
-
-    // SI LA CACHÉ SIGUE TOTALMENTE VACÍA (Cold Start + Error de Red Inicial):
-    // Respondemos SIEMPRE con HTTP 200 e indicamos "cooling_down" para evitar errores HTTP 503 en Wix
+    // Si la RAM está vacía, no ataca a España en cada llamada GET. Solo lo intenta si venció el tiempo.
     if (!cachedProperties || cachedProperties.length === 0) {
+        triggerFetchIfAllowed();
         return res.status(200).json({
             status: "cooling_down",
             properties: [],
@@ -244,9 +191,7 @@ app.get('/api/properties', async (req, res) => {
             limit,
             hasMore: false,
             cachedAt: null,
-            remote_cooldown: true,
-            note: `El proxy está inicializando y España se encuentra en enfriamiento. Esperando primera sincronización. Detalle: ${warningMessage || "Esperando descarga inicial."}`,
-            warning: warningMessage
+            note: "Enfriamiento activo de España. El servidor está en silencio de red para liberar la API."
         });
     }
 
@@ -254,25 +199,18 @@ app.get('/api/properties', async (req, res) => {
     const endIndex = startIndex + limit;
     const paginatedItems = cachedProperties.slice(startIndex, endIndex);
 
-    let noteMessage = "Sincronización de caché activa y saludable.";
-    if (remoteCooldownActive) {
-        noteMessage = `Servidor en enfriamiento o lote externo degradado. ${warningMessage || ""}`;
-    }
-
     res.json({
-        status: remoteCooldownActive ? "ready" : "success",
+        status: "success",
         properties: paginatedItems,
         total: cachedProperties.length,
         page,
         limit,
         hasMore: endIndex < cachedProperties.length,
-        cachedAt: lastCachedTime > 0 ? new Date(lastCachedTime).toISOString() : null,
-        remote_cooldown: remoteCooldownActive,
-        note: noteMessage,
-        warning: warningMessage
+        cachedAt: new Date(lastCachedTime).toISOString(),
+        note: "Datos servidos desde memoria RAM protegida."
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`[Proxy] Servidor corriendo en el puerto ${PORT}`);
+    console.log(`[Proxy] Listo en puerto ${PORT}`);
 });

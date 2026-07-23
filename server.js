@@ -4,12 +4,14 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Estado de memoria RAM y control de trafico
 let cachedProperties = null;
 let lastCachedTime = 0;
 let isFetching = false;
 let lastFetchAttempt = 0;
-const FETCH_COOLDOWN_MS = 10 * 60 * 1000; // 10 Minutos de silencio estricto para España
+
+// Si la RAM está vacía, reintenta cada 2 minutos. Si ya tiene datos, mantiene 4 horas.
+const EMPTY_RETRY_COOLDOWN_MS = 2 * 60 * 1000; 
+const CACHE_DURATION = 4 * 60 * 60 * 1000;
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -90,9 +92,9 @@ async function fetchAndParseXml() {
     lastFetchAttempt = Date.now();
 
     return new Promise((resolve, reject) => {
-        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0&n=1000&i=True";
+        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0";
         
-        const req = https.get(url, { timeout: 30000 }, (res) => {
+        const req = https.get(url, { timeout: 35000 }, (res) => {
             if (res.statusCode !== 200) {
                 isFetching = false;
                 return reject(new Error(`API respondió HTTP ${res.statusCode}`));
@@ -156,31 +158,33 @@ async function fetchAndParseXml() {
 
 async function triggerFetchIfAllowed() {
     const timeSinceLast = Date.now() - lastFetchAttempt;
-    if (isFetching || (lastFetchAttempt > 0 && timeSinceLast < FETCH_COOLDOWN_MS)) {
-        return; // Respeta estrictamente los 10 minutos de silencio de red
+    const cooldownNeeded = (!cachedProperties || cachedProperties.length === 0) ? EMPTY_RETRY_COOLDOWN_MS : CACHE_DURATION;
+
+    if (isFetching || (lastFetchAttempt > 0 && timeSinceLast < cooldownNeeded)) {
+        return;
     }
+
     try {
-        console.log("[Proxy Worker] Ejecutando consulta controlada a España...");
+        console.log("[Proxy Worker] Consultando catálogo a España...");
         const data = await fetchAndParseXml();
-        if (data && data.length >= 15) {
+        if (data && data.length >= 10) {
             cachedProperties = data;
             lastCachedTime = Date.now();
-            console.log(`[Proxy Worker SUCCESS] RAM cargada con ${cachedProperties.length} inmuebles.`);
+            console.log(`[Proxy Worker SUCCESS] RAM poblada con ${cachedProperties.length} inmuebles.`);
         }
     } catch (err) {
-        console.warn("[Proxy Worker WARN] Intento fallido. Guardando silencio de red:", err.message);
+        console.warn("[Proxy Worker WARN] Intento no completado:", err.message);
     }
 }
 
-// Bucle silencioso interno cada 2 minutos (solo atacará a España si han pasado los 10 min)
-setInterval(triggerFetchIfAllowed, 2 * 60 * 1000);
-setTimeout(triggerFetchIfAllowed, 3000);
+// Bucle dinámico cada 30 segundos
+setInterval(triggerFetchIfAllowed, 30000);
+setTimeout(triggerFetchIfAllowed, 2000);
 
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
 
-    // Si la RAM está vacía, no ataca a España en cada llamada GET. Solo lo intenta si venció el tiempo.
     if (!cachedProperties || cachedProperties.length === 0) {
         triggerFetchIfAllowed();
         return res.status(200).json({
@@ -191,7 +195,7 @@ app.get('/api/properties', async (req, res) => {
             limit,
             hasMore: false,
             cachedAt: null,
-            note: "Enfriamiento activo de España. El servidor está en silencio de red para liberar la API."
+            note: "Enfriamiento activo de España. Reintentando de forma dinámica..."
         });
     }
 

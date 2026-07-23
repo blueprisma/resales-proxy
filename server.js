@@ -4,7 +4,6 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Permisos CORS para comunicación segura con Wix Studio
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -13,182 +12,169 @@ app.use((req, res, next) => {
     next();
 });
 
-// Configuración de caché interna en memoria
-let cachedProperties = null;
+let cachedProperties = [];
 let lastCachedTime = 0;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas de ciclo de vida de la caché
+let isSyncing = false;
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas de memoria RAM
 
-// Saneamiento y mapeo robusto de tags XML a JSON para Wix Studio
-function parseSingleProperty(block) {
-    const getTagValue = (tag) => {
-        const regex = new RegExp(`<${tag}>([^<]*)</${tag}>`, 'i');
-        const match = block.match(regex);
-        return match ? match[1].trim() : '';
-    };
+function parsePropertiesFromXml(xmlString) {
+    const properties = [];
+    if (!xmlString || typeof xmlString !== 'string') return properties;
 
-    // Clave primaria única para la base de datos de Wix
-    const propertyid = getTagValue('Reference') || getTagValue('PropertyRefNo') || getTagValue('RefNo') || '';
-    if (!propertyid) return null;
+    let cleanXml = xmlString.replace(/<(?:Property|property)\b/gi, '<Property').replace(/<\/(?:Property|property)>/gi, '</Property>');
+    if (!cleanXml.includes('<Property')) return properties;
 
-    const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
-    const location = getTagValue('Area') || getTagValue('Location') || getTagValue('Town') || 'Alicante';
-    const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
-    const marketType = isNewDev ? 'New Development' : 'Resale';
-    const price = parseFloat(getTagValue('Price')) || 0;
-    const beds = parseInt(getTagValue('Bedrooms')) || parseInt(getTagValue('Beds')) || 0;
-    const baths = parseInt(getTagValue('Bathrooms')) || parseInt(getTagValue('Baths')) || 0;
-    const sqm = parseFloat(getTagValue('Built')) || parseFloat(getTagValue('sqm')) || 0;
-    const propertyType = getTagValue('Type') || 'Property';
-    const description = getTagValue('Description') || getTagValue('Desc') || '';
+    const propertyBlocks = cleanXml.split('<Property');
+    propertyBlocks.shift();
 
-    // Extracción limpia de la lista de imágenes
-    let images = [];
-    const picturesMatch = block.match(/<Pictures>([\s\S]*?)<\/Pictures>/i);
-    if (picturesMatch) {
-        const urlMatches = picturesMatch[1].match(/<Url>([^<]*)<\/Url>/gi);
-        if (urlMatches) {
-            images = urlMatches.map(m => m.replace(/<\/?Url>/gi, '').trim());
+    for (let rawBlock of propertyBlocks) {
+        const block = rawBlock.split('</Property>')[0];
+
+        const getTagValue = (tag) => {
+            const regex = new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`, 'i');
+            const match = block.match(regex);
+            return match ? match[1].trim() : '';
+        };
+
+        const propertyid = getTagValue('Reference') || getTagValue('PropertyRefNo') || getTagValue('RefNo') || getTagValue('id') || '';
+        if (!propertyid) continue;
+
+        const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
+        const location = getTagValue('Area') || getTagValue('Location') || getTagValue('Town') || 'Costa Blanca';
+        const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
+        const marketType = isNewDev ? 'New Development' : 'Resale';
+        const price = parseFloat(getTagValue('Price')) || 0;
+        const beds = parseInt(getTagValue('Bedrooms')) || parseInt(getTagValue('Beds')) || 0;
+        const baths = parseInt(getTagValue('Bathrooms')) || parseInt(getTagValue('Baths')) || 0;
+        const sqm = parseFloat(getTagValue('Built')) || parseFloat(getTagValue('sqm')) || 0;
+        const propertyType = getTagValue('Type') || 'Property';
+        const description = getTagValue('Description') || getTagValue('Desc') || '';
+
+        let images = [];
+        const picturesMatch = block.match(/<Pictures[^>]*>([\s\S]*?)<\/Pictures>/i);
+        if (picturesMatch) {
+            const urlMatches = picturesMatch[1].match(/<Url[^>]*>([^<]*)<\/Url>/gi);
+            if (urlMatches) {
+                images = urlMatches.map(m => m.replace(/<\/?Url[^>]*>/gi, '').trim());
+            }
         }
+
+        const mainimage = images.length > 0 ? images[0] : 'https://wixideas.wixsite.com/images/placeholder.png';
+
+        properties.push({
+            _id: propertyid,
+            title,
+            location,
+            marketType,
+            price,
+            beds,
+            baths,
+            mainimage,
+            propertyid,
+            sqm,
+            propertyType,
+            images: images.join(','),
+            description
+        });
     }
 
-    if (images.length === 0) {
-        const urlMatches = block.match(/<Url>([^<]*)<\/Url>/gi);
-        if (urlMatches) {
-            images = urlMatches.map(m => m.replace(/<\/?Url>/gi, '').trim());
-        }
-    }
-
-    const mainimage = images.length > 0 ? images[0] : 'https://wixideas.wixsite.com/images/placeholder.png';
-
-    return {
-        _id: propertyid, // _id requerido en WixData para bulkSave
-        title,
-        location,
-        marketType,
-        price,
-        beds,
-        baths,
-        mainimage,
-        propertyid,
-        sqm,
-        propertyType,
-        images,
-        description
-    };
+    return properties;
 }
 
-// Descarga en formato streaming interceptando bloqueos por concurrencia
-async function fetchAndParseXmlStream() {
+function fetchBatch(p1 = 1, p2 = 500) {
     return new Promise((resolve, reject) => {
-        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
-        
-        https.get(url, (res) => {
+        // URL Oficial con Paginación Batch de 500 (Protocolo Oficial de Resales Online)
+        const url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&n=500&p1=${p1}&p2=${p2}`;
+
+        https.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Accept': '*/*'
+            }
+        }, (res) => {
             if (res.statusCode !== 200) {
-                reject(new Error(`El servidor de origen respondió con código HTTP: ${res.statusCode}`));
-                return;
+                return reject(new Error(`Estatus HTTP España: ${res.statusCode}`));
             }
 
-            const properties = [];
-            let buffer = '';
-            let isLocked = false;
-
+            let data = '';
             res.setEncoding('utf8');
-
-            res.on('data', (chunk) => {
-                buffer += chunk;
-                
-                // Defensa temprana: Detecta si la respuesta inicial contiene el bloqueo de 10 minutos
-                if (buffer.length < 1500) {
-                    const hasLockMessage = buffer.includes('previous instance') || 
-                                           buffer.includes('Please wait') || 
-                                           buffer.includes('running');
-                    
-                    if (hasLockMessage) {
-                        isLocked = true;
-                        res.destroy(); // Destruye el canal de inmediato para liberar RAM
-                        reject(new Error("RESALES_CONCURRENCY_LOCK"));
-                        return;
-                    }
-                }
-
-                let propertyIndex = buffer.indexOf('<Property>');
-
-                while (propertyIndex !== -1) {
-                    const closingIndex = buffer.indexOf('</Property>', propertyIndex);
-                    if (closingIndex === -1) {
-                        break; 
-                    }
-
-                    const block = buffer.substring(propertyIndex + 10, closingIndex);
-                    const parsed = parseSingleProperty(block);
-                    
-                    if (parsed) {
-                        properties.push(parsed);
-                    }
-
-                    buffer = buffer.substring(closingIndex + 11);
-                    propertyIndex = buffer.indexOf('<Property>');
-                }
-            });
-
-            res.on('end', () => {
-                if (isLocked) return;
-                
-                if (properties.length === 0 && (buffer.includes('feed_version') || buffer.includes('resalesonline'))) {
-                    reject(new Error("RESALES_EMPTY_RESPONSE_LOCK"));
-                    return;
-                }
-                
-                resolve(properties);
-            });
-
-            res.on('error', (err) => {
-                if (!isLocked) reject(err);
-            });
-        }).on('error', (err) => {
-            reject(err);
-        });
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve(data));
+            res.on('error', err => reject(err));
+        }).on('error', err => reject(err));
     });
 }
 
-// Rutas de la API
+async function downloadAllPropertiesInBatches() {
+    if (isSyncing) return cachedProperties;
+    isSyncing = true;
+
+    console.log("[Proxy] Iniciando descarga secuencial por lotes de 500 (Protocolo Oficial)...");
+    let allItems = [];
+    let p1 = 1;
+    let p2 = 500;
+    let hasMore = true;
+    let consecutiveErrors = 0;
+
+    while (hasMore && consecutiveErrors < 3) {
+        try {
+            console.log(`[Proxy] Descargando lote ${p1} a ${p2}...`);
+            const xmlData = await fetchBatch(p1, p2);
+
+            if (xmlData.includes('previous instance') || xmlData.includes('Please wait')) {
+                console.warn("[Proxy] Servidor de España requiere enfriamiento temporal.");
+                break;
+            }
+
+            const parsedBatch = parsePropertiesFromXml(xmlData);
+
+            if (parsedBatch.length === 0) {
+                console.log("[Proxy] Fin de la transmisión. Lote vacío recibido.");
+                hasMore = false;
+            } else {
+                allItems = allItems.concat(parsedBatch);
+                p1 += 500;
+                p2 += 500;
+                // Pequeña pausa de 300ms entre lotes para respetar el servidor de España
+                await new Promise(r => setTimeout(r, 300));
+            }
+        } catch (err) {
+            console.error(`[Proxy] Error descargando lote ${p1}-${p2}:`, err.message);
+            consecutiveErrors++;
+        }
+    }
+
+    if (allItems.length > 0) {
+        cachedProperties = allItems;
+        lastCachedTime = Date.now();
+        console.log(`[Proxy] Descarga masiva completada. Total propiedades en RAM: ${cachedProperties.length}`);
+    }
+
+    isSyncing = false;
+    return cachedProperties;
+}
+
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
     const forceRefresh = req.query.refresh === 'true';
 
     try {
-        const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
+        const isExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
 
-        if (!cachedProperties || isCacheExpired || forceRefresh) {
-            console.log("[Proxy] Solicitando actualización de datos a Resales-Online...");
-            
-            try {
-                const fetchedData = await fetchAndParseXmlStream();
-                cachedProperties = fetchedData;
-                lastCachedTime = Date.now();
-                console.log(`[Proxy] Caché de memoria actualizada. Registros: ${cachedProperties.length}`);
-                res.setHeader('X-Cache-Status', 'MISS');
-            } catch (streamError) {
-                console.warn("[Proxy] Fallo en la llamada directa al proveedor:", streamError.message);
-                
-                if (cachedProperties && cachedProperties.length > 0) {
-                    console.log("[Proxy] Sirviendo caché persistente anterior para evitar desconexión.");
-                    res.setHeader('X-Cache-Status', 'STALE_DUE_TO_LOCK');
-                    res.setHeader('X-Cache-Warning', streamError.message);
-                } else {
-                    if (streamError.message === "RESALES_CONCURRENCY_LOCK" || streamError.message === "RESALES_EMPTY_RESPONSE_LOCK") {
-                        return res.status(429).json({
-                            status: "error",
-                            code: "PROVIDER_LOCKED",
-                            message: "Resales-Online está procesando el XML en segundo plano o el feed está bloqueado temporalmente. Por favor, espere 10 minutos."
-                        });
-                    }
-                    throw streamError;
-                }
+        if (cachedProperties.length === 0 || isExpired || forceRefresh) {
+            if (!isSyncing) {
+                downloadAllPropertiesInBatches();
             }
-        } else {
-            res.setHeader('X-Cache-Status', 'HIT');
+
+            if (cachedProperties.length === 0) {
+                return res.json({
+                    status: "processing",
+                    message: "Descargando catálogo de 12,000+ propiedades por lotes de 500. Por favor recarga en 30 segundos.",
+                    total: 0,
+                    properties: []
+                });
+            }
         }
 
         const startIndex = (page - 1) * limit;
@@ -206,7 +192,7 @@ app.get('/api/properties', async (req, res) => {
         });
 
     } catch (error) {
-        console.error("[Proxy Error] Fallo crítico:", error);
+        console.error("[Proxy Error]:", error);
         res.status(500).json({ status: "error", message: error.message });
     }
 });

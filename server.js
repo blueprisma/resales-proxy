@@ -4,126 +4,153 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware CORS obligatorio para habilitar solicitudes desde Wix Studio / Velo
+// Variables de caché persistente en memoria RAM
+let cachedProperties = null;
+let lastCachedTime = 0;
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // Caché de 4 Horas
+
+// Middleware de CORS manual completo para compatibilidad con Wix Studio
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') return res.status(200).end();
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
     next();
 });
 
-let cachedProperties = null;
-let lastCachedTime = 0;
-let isSyncing = false;
-let lastError = null;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas en memoria RAM
+app.use(express.json());
 
-// Extractor de valores con soporte para nodos multilingües (<es> / <uk>)
-function getTagValue(block, tag) {
-    const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
+// Saneamiento de textos con prioridad en traducción al español <es>
+function getCleanTagValue(block, tag) {
+    const regex = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i');
     const match = block.match(regex);
     if (!match) return '';
-    let val = match[1].trim();
     
-    if (val.includes('<')) {
-        const esMatch = val.match(/<es[^>]*>([\s\S]*?)<\/es>/i);
-        if (esMatch) return esMatch[1].trim();
-        const ukMatch = val.match(/<uk[^>]*>([\s\S]*?)<\/uk>/i);
-        if (ukMatch) return ukMatch[1].trim();
-        val = val.replace(/<[^>]+>/g, '').trim();
+    const innerContent = match[1].trim();
+
+    // Priorizamos la etiqueta en español si existe traducción multilingüe
+    const esMatch = innerContent.match(/<es>([\s\S]*?)<\/es>/i);
+    if (esMatch) {
+        return esMatch[1].trim();
     }
-    return val;
+
+    // Si tiene otros subnodos HTML pero no es español, limpiamos etiquetas
+    if (innerContent.includes('<') && innerContent.includes('>')) {
+        return innerContent.replace(/<[^>]*>/g, '').trim();
+    }
+
+    return innerContent;
 }
 
-// Interpreter individual de cada inmueble
+// Procesador individual tolerante a fallos para cada propiedad
 function parseSingleProperty(block) {
-    // LECTURA DIRECTA DE <id> SEGÚN AUDITORÍA
-    const propertyid = getTagValue(block, 'id') || getTagValue(block, 'reference') || getTagValue(block, 'propertyrefno') || getTagValue(block, 'ref');
-    if (!propertyid) return null;
+    // ID único prioritario del nodo <id>
+    const propertyid = getCleanTagValue(block, 'id') || getCleanTagValue(block, 'Reference') || getCleanTagValue(block, 'PropertyRefNo') || '';
+    if (!propertyid) return null; // Si no tiene un ID estructurado, descartamos la fila
 
-    const title = getTagValue(block, 'title') || `Propiedad Ref: ${propertyid}`;
+    const title = getCleanTagValue(block, 'title') || getCleanTagValue(block, 'type') || `Propiedad Ref: ${propertyid}`;
     
-    // Mapeo preferente de PUEBLOS: Town (Jávea, Dénia, Calpe...) -> Urbanización -> Área Macro
-    const pueblo = getTagValue(block, 'town') || getTagValue(block, 'city') || getTagValue(block, 'municipality');
-    const urbanizacion = getTagValue(block, 'urbanisation') || getTagValue(block, 'urbanization');
-    const areaMacro = getTagValue(block, 'area') || getTagValue(block, 'location') || 'Costa Blanca';
-    const location = pueblo || urbanizacion || areaMacro;
+    // Mapeo geográfico priorizando town o city sobre área o localización
+    const location = getCleanTagValue(block, 'town') || 
+                     getCleanTagValue(block, 'city') || 
+                     getCleanTagValue(block, 'area') || 
+                     getCleanTagValue(block, 'location') || 
+                     'Costa Blanca';
 
-    const isNewDev = getTagValue(block, 'newdevelopment') === '1' || getTagValue(block, 'newdevelopment') === 'true';
+    const isNewDev = getCleanTagValue(block, 'newdevelopment') === '1' || 
+                     getCleanTagValue(block, 'newdevelopment') === 'true' || 
+                     getCleanTagValue(block, 'new_development') === '1';
+                     
     const marketType = isNewDev ? 'New Development' : 'Resale';
-    const price = parseFloat(getTagValue(block, 'price')) || 0;
-    const beds = parseInt(getTagValue(block, 'bedrooms')) || parseInt(getTagValue(block, 'beds')) || 0;
-    const baths = parseInt(getTagValue(block, 'bathrooms')) || parseInt(getTagValue(block, 'baths')) || 0;
-    const sqm = parseFloat(getTagValue(block, 'built')) || parseFloat(getTagValue(block, 'sqm')) || 0;
-    const propertyType = getTagValue(block, 'type') || getTagValue(block, 'subtype') || 'Property';
-    const description = getTagValue(block, 'description') || getTagValue(block, 'desc') || '';
+    const price = parseFloat(getCleanTagValue(block, 'price')) || 0;
+    const beds = parseInt(getCleanTagValue(block, 'bedrooms')) || parseInt(getCleanTagValue(block, 'beds')) || 0;
+    const baths = parseInt(getCleanTagValue(block, 'bathrooms')) || parseInt(getCleanTagValue(block, 'baths')) || 0;
+    const sqm = parseFloat(getCleanTagValue(block, 'built')) || parseFloat(getCleanTagValue(block, 'built_size')) || parseFloat(getCleanTagValue(block, 'sqm')) || 0;
+    const propertyType = getCleanTagValue(block, 'type') || 'Property';
+    const description = getCleanTagValue(block, 'description') || getCleanTagValue(block, 'desc') || '';
 
-    // Extractor universal de imágenes por extensión
-    let images = [];
-    const picturesMatch = block.match(/<(?:pictures|images|photos)[^>]*>([\s\S]*?)<\/(?:pictures|images|photos)>/i);
-    const searchTarget = picturesMatch ? picturesMatch[1] : block;
-    const urlMatches = searchTarget.match(/https?:\/\/[^\s"<>]+\.(?:jpg|jpeg|png|webp|gif)/gi);
-    if (urlMatches) {
-        images = [...new Set(urlMatches)];
-    }
-
-    const mainimage = images.length > 0 ? images[0] : 'https://wixideas.wixsite.com/images/placeholder.png';
+    // Extracción de todas las URLs de imágenes válidas (insensible a mayúsculas)
+    const imgRegex = /https?:\/\/[^<>\s"']+\.(?:jpg|jpeg|png|webp)/gi;
+    const matchedUrls = block.match(imgRegex) || [];
+    
+    // Deduplicación de URLs de imágenes encontradas
+    const uniqueUrls = [...new Set(matchedUrls.map(url => url.trim()))];
+    
+    // images: String separado por comas de todas las fotos
+    const imagesStr = uniqueUrls.join(',');
+    const mainimage = uniqueUrls.length > 0 ? uniqueUrls[0] : 'https://wixideas.wixsite.com/images/placeholder.png';
 
     return {
-        _id: propertyid,
+        _id: propertyid, // Clave principal de Velo en Wix Studio
         title,
         location,
         marketType,
         price,
         beds,
         baths,
-        mainimage,
-        propertyid,
         sqm,
         propertyType,
-        images: images.join(','),
-        description
+        description,
+        mainimage,
+        propertyid,
+        images: imagesStr
     };
 }
 
-// Descarga en memoria sin filtros restrictivos
+// Descarga en buffer y parseo seguro con detección de bloqueos
 async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
+        // Endpoint V3 Oficial del proyecto ININMO7 con flag de base de datos completa
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0";
         
-        const req = https.get(url, { 
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'Accept': '*/*'
-            },
-            timeout: 25000 
-        }, (res) => {
+        // Timeout de conexión establecido a 20 segundos
+        const req = https.get(url, { timeout: 20000 }, (res) => {
             if (res.statusCode !== 200) {
-                return reject(new Error(`Estatus HTTP España: ${res.statusCode}`));
+                reject(new Error(`API de origen respondió con estado HTTP: ${res.statusCode}`));
+                return;
             }
 
             let data = '';
             res.setEncoding('utf8');
-            res.on('data', chunk => data += chunk);
+
+            res.on('data', (chunk) => {
+                data += chunk;
+            });
 
             res.on('end', () => {
-                if (data.includes('previous instance') || data.includes('Please wait')) {
-                    return reject(new Error("RESALES_CONCURRENCY_LOCK"));
+                // Validación del bloqueo concurrente en la respuesta del proveedor
+                const hasLockMessage = data.includes('previous instance') || 
+                                       data.includes('Please wait') || 
+                                       data.includes('running');
+                if (hasLockMessage) {
+                    reject(new Error("RESALES_CONCURRENCY_LOCK"));
+                    return;
                 }
 
-                // EXTRACCIÓN GLOBAL ROBUSTA DE BLOQUES <property>
-                const propertyBlocks = data.match(/<\s*(?:property|property_item)\b[\s\S]*?>([\s\S]*?)<\/\s*(?:property|property_item)\s*>/gi);
-                
-                if (!propertyBlocks || propertyBlocks.length === 0) {
-                    const err = new Error("PARSED_ZERO_PROPERTIES");
-                    err.rawXmlSnippet = data.substring(0, 500);
-                    return reject(err);
+                // Detección dinámica de la envoltura de propiedad
+                let startTag = '';
+                let endTag = '';
+
+                const tagMatch = data.match(/<(Property_Item|Property|property_item|property)>/i);
+                if (tagMatch) {
+                    startTag = tagMatch[0];
+                    endTag = startTag.replace('<', '</');
+                } else {
+                    const err = new Error("NO_PROPERTY_TAGS_FOUND");
+                    err.rawXmlSnippet = data.substring(0, 1000);
+                    reject(err);
+                    return;
                 }
 
                 const properties = [];
+                const propertyBlocks = data.split(new RegExp(startTag, 'i'));
+                propertyBlocks.shift();
+
                 for (let block of propertyBlocks) {
-                    const parsed = parseSingleProperty(block);
+                    const cleanBlock = block.split(new RegExp(endTag, 'i'))[0];
+                    const parsed = parseSingleProperty(cleanBlock);
                     if (parsed) {
                         properties.push(parsed);
                     }
@@ -131,14 +158,17 @@ async function fetchAndParseXml() {
 
                 if (properties.length === 0) {
                     const err = new Error("PARSED_ZERO_PROPERTIES");
-                    err.rawXmlSnippet = data.substring(0, 500);
-                    return reject(err);
+                    err.rawXmlSnippet = data.substring(0, 1000);
+                    reject(err);
+                    return;
                 }
 
                 resolve(properties);
             });
 
-            res.on('error', err => reject(err));
+            res.on('error', (err) => {
+                reject(err);
+            });
         });
 
         req.on('timeout', () => {
@@ -146,46 +176,64 @@ async function fetchAndParseXml() {
             reject(new Error("RESALES_CONNECTION_TIMEOUT"));
         });
 
-        req.on('error', err => reject(err));
+        req.on('error', (err) => {
+            reject(err);
+        });
     });
 }
 
-// Endpoint Principal de API
+// Ruta API Paginada para Wix Studio
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
     const forceRefresh = req.query.refresh === 'true';
 
-    const isExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
+    const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
     let remoteCooldownActive = false;
+    let warningMessage = null;
+    let noteMessage = "Sincronización de caché activa y saludable.";
+    let rawXmlSnippet = "";
 
-    if (!cachedProperties || cachedProperties.length === 0 || isExpired || forceRefresh) {
-        if (!isSyncing) {
-            isSyncing = true;
-            console.log("[Proxy] Descargando catálogo desde España...");
-            try {
-                const fetchedData = await fetchAndParseXml();
-                cachedProperties = fetchedData;
-                lastCachedTime = Date.now();
-                lastError = null;
-                console.log(`[Proxy] Éxito. Inmuebles en RAM: ${cachedProperties.length}`);
-            } catch (error) {
-                console.warn("[Proxy Error]:", error.message);
-                remoteCooldownActive = true;
-                lastError = error.message;
-                if (!cachedProperties) cachedProperties = [];
-            } finally {
-                isSyncing = false;
+    if (!cachedProperties || cachedProperties.length === 0 || isCacheExpired || forceRefresh) {
+        console.log("[Proxy] Solicitando actualización de datos a Resales-Online...");
+        try {
+            const fetchedData = await fetchAndParseXml();
+            cachedProperties = fetchedData;
+            lastCachedTime = Date.now();
+            console.log(`[Proxy] Caché de RAM actualizada. Registros válidos: ${cachedProperties.length}`);
+            res.setHeader('X-Cache-Status', 'MISS');
+        } catch (error) {
+            console.warn("[Proxy] La llamada de red externa falló. Causa:", error.message);
+            remoteCooldownActive = true;
+            warningMessage = error.message;
+
+            if (error.rawXmlSnippet) {
+                rawXmlSnippet = error.rawXmlSnippet.substring(0, 500);
+            }
+
+            if (!cachedProperties) {
+                cachedProperties = [];
             }
         }
+    } else {
+        res.setHeader('X-Cache-Status', 'HIT');
     }
 
     const startIndex = (page - 1) * limit;
     const endIndex = startIndex + limit;
     const paginatedItems = cachedProperties.slice(startIndex, endIndex);
 
+    if (cachedProperties.length === 0) {
+        noteMessage = "El XML recibido no contenía bloques de propiedades válidos.";
+        if (rawXmlSnippet) {
+            noteMessage += ` Auditoría XML crudo: ${rawXmlSnippet}`;
+        } else if (warningMessage) {
+            noteMessage += ` Error de conexión del proveedor: ${warningMessage}`;
+        }
+    }
+
     res.json({
-        status: cachedProperties.length > 0 ? "success" : "ready",
+        status: remoteCooldownActive ? "ready" : "success",
         properties: paginatedItems,
         total: cachedProperties.length,
         page,
@@ -193,10 +241,11 @@ app.get('/api/properties', async (req, res) => {
         hasMore: endIndex < cachedProperties.length,
         cachedAt: lastCachedTime > 0 ? new Date(lastCachedTime).toISOString() : null,
         remote_cooldown: remoteCooldownActive,
-        note: lastError || null
+        note: noteMessage,
+        warning: warningMessage
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`[Proxy] Servidor listo en puerto ${PORT}`);
+    console.log(`[Proxy] Servidor corriendo en el puerto ${PORT}`);
 });

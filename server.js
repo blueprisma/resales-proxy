@@ -1,4 +1,4 @@
-import express from 'express';
+çimport express from 'express';
 import https from 'https';
 
 const app = express();
@@ -16,11 +16,10 @@ let syncProgress = {
     inProgress: false,
     pagesFetched: 0,
     propertiesDownloadedThisCycle: 0,
-    lastStatusMessage: "Esperando inicio..."
+    lastStatusMessage: "Iniciando consulta..."
 };
 
 const CLEAN_LOAD_PAGE_SIZE = 50;  
-const INCREMENTAL_PAGE_SIZE = 100; 
 const MAX_PAGES_PER_SYNC = 400;   
 
 app.use((req, res, next) => {
@@ -100,10 +99,10 @@ function parseSingleProperty(block) {
     };
 }
 
-function fetchXmlPage(isCleanLoadFirstCall, pageSize) {
+function fetchXmlPage(shouldSendI) {
     return new Promise((resolve, reject) => {
-        let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${pageSize}`;
-        if (isCleanLoadFirstCall) {
+        let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${CLEAN_LOAD_PAGE_SIZE}`;
+        if (shouldSendI) {
             url += '&I=TRUE';
         }
 
@@ -125,7 +124,6 @@ function fetchXmlPage(isCleanLoadFirstCall, pageSize) {
 
             res.on('end', () => {
                 const lowerData = data.toLowerCase();
-                // Si España está preparando el archivo, devolvemos señal de espera sin arrojar error fatal
                 if (lowerData.includes('previous instance') || lowerData.includes('please wait') || lowerData.includes('running')) {
                     return resolve({ status: 'WAIT_FOR_GENERATION', properties: [] });
                 }
@@ -170,7 +168,7 @@ async function runSyncCycle() {
     isSyncing = true;
 
     const isThisACleanLoad = !hasPerformedCleanLoad;
-    const pageSize = isThisACleanLoad ? CLEAN_LOAD_PAGE_SIZE : INCREMENTAL_PAGE_SIZE;
+    let needToSendI = isThisACleanLoad; // Flag de un solo uso para I=TRUE
 
     syncProgress = {
         inProgress: true,
@@ -179,7 +177,7 @@ async function runSyncCycle() {
         lastStatusMessage: "Iniciando consulta..."
     };
 
-    console.log(`[Proxy Worker] Iniciando descarga (${isThisACleanLoad ? 'Clean Load I=TRUE' : 'Incremental'}), lote size: ${pageSize}...`);
+    console.log(`[Proxy Worker] Iniciando descarga (${isThisACleanLoad ? 'Clean Load' : 'Incremental'}), lote size: ${CLEAN_LOAD_PAGE_SIZE}...`);
 
     try {
         let pageCount = 0;
@@ -187,15 +185,18 @@ async function runSyncCycle() {
         let keepFetching = true;
 
         while (keepFetching && pageCount < MAX_PAGES_PER_SYNC) {
-            const isFirstCallOfClean = (isThisACleanLoad && pageCount === 0);
+            const shouldSendI = needToSendI;
+            
+            const result = await fetchXmlPage(shouldSendI);
 
-            const result = await fetchXmlPage(isFirstCallOfClean, pageSize);
+            // Desactivamos I=TRUE inmediatamente para los siguientes intentos/páginas
+            needToSendI = false;
 
             if (result.status === 'WAIT_FOR_GENERATION') {
-                console.log("[Proxy Worker] España está preparando el archivo. Pausa inteligente de 15 segundos...");
-                syncProgress.lastStatusMessage = "España está generando el archivo. Esperando 15 segundos para recibir datos...";
-                await wait(15000);
-                continue; // Reintenta el ciclo sin incrementar pageCount para no perder el turno
+                console.log("[Proxy Worker] España está generando el feed. Esperando 10 segundos antes de consultar el lote listo...");
+                syncProgress.lastStatusMessage = "España está procesando el catálogo. Reintentando lectura en 10 segundos...";
+                await wait(10000);
+                continue; // Reintenta llamar a la API SIN I=TRUE
             }
 
             const properties = result.properties || [];
@@ -214,11 +215,11 @@ async function runSyncCycle() {
 
             totalReceived += properties.length;
             syncProgress.propertiesDownloadedThisCycle = totalReceived;
-            syncProgress.lastStatusMessage = `Descargadas ${cachedPropertiesMap.size} propiedades (Lote ${pageCount} completado)...`;
+            syncProgress.lastStatusMessage = `Descargadas ${cachedPropertiesMap.size} propiedades de España (Lote ${pageCount} completado)...`;
 
             console.log(`[Proxy Worker] Lote ${pageCount}: +${properties.length} (Total acumulado en RAM: ${cachedPropertiesMap.size}).`);
 
-            if (properties.length < pageSize) {
+            if (properties.length < CLEAN_LOAD_PAGE_SIZE) {
                 keepFetching = false;
             } else {
                 await wait(300);

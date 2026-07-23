@@ -8,10 +8,10 @@ let cachedProperties = null;
 let lastCachedTime = 0;
 let isFetching = false;
 let lastFetchAttempt = 0;
+let lastFetchError = "Esperando primer intento de conexión...";
 
-// Si la RAM está vacía, reintenta cada 2 minutos. Si ya tiene datos, mantiene 4 horas.
-const EMPTY_RETRY_COOLDOWN_MS = 2 * 60 * 1000; 
-const CACHE_DURATION = 4 * 60 * 60 * 1000;
+const EMPTY_RETRY_COOLDOWN_MS = 90 * 1000; // 90 segundos de pausa entre reintentos en frío
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 horas de vida de la caché llena
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -94,10 +94,21 @@ async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0";
         
-        const req = https.get(url, { timeout: 35000 }, (res) => {
+        // Opciones con cabecera de navegador real para evitar bloqueos
+        const options = {
+            timeout: 30000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            }
+        };
+
+        const req = https.get(url, options, (res) => {
             if (res.statusCode !== 200) {
                 isFetching = false;
-                return reject(new Error(`API respondió HTTP ${res.statusCode}`));
+                const err = `API respondió con código HTTP ${res.statusCode}`;
+                lastFetchError = err;
+                return reject(new Error(err));
             }
 
             let data = '';
@@ -107,7 +118,9 @@ async function fetchAndParseXml() {
             res.on('end', () => {
                 isFetching = false;
                 if (data.includes('previous instance') || data.includes('Please wait') || data.includes('running')) {
-                    return reject(new Error("RESALES_CONCURRENCY_LOCK"));
+                    const err = "Bloqueo por consulta concurrente en España (previous instance running)";
+                    lastFetchError = err;
+                    return reject(new Error(err));
                 }
 
                 let startTag = '';
@@ -117,7 +130,10 @@ async function fetchAndParseXml() {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
                 } else {
-                    return reject(new Error("NO_PROPERTY_TAGS_FOUND"));
+                    const snippet = data.substring(0, 150).replace(/(\r\n|\n|\r)/gm, " ");
+                    const err = `Respuesta no contiene XML de propiedades. Muestra: "${snippet}"`;
+                    lastFetchError = err;
+                    return reject(new Error(err));
                 }
 
                 const properties = [];
@@ -131,14 +147,18 @@ async function fetchAndParseXml() {
                 }
 
                 if (properties.length === 0) {
-                    return reject(new Error("PARSED_ZERO_PROPERTIES"));
+                    const err = "El parser procesó 0 propiedades del XML recibido.";
+                    lastFetchError = err;
+                    return reject(new Error(err));
                 }
 
+                lastFetchError = "Ninguno (Sincronizado con éxito)";
                 resolve(properties);
             });
 
             res.on('error', err => {
                 isFetching = false;
+                lastFetchError = err.message;
                 reject(err);
             });
         });
@@ -146,11 +166,14 @@ async function fetchAndParseXml() {
         req.on('timeout', () => {
             req.destroy();
             isFetching = false;
-            reject(new Error("RESALES_CONNECTION_TIMEOUT"));
+            const err = "Tiempo de espera agotado al conectar con España (30s timeout)";
+            lastFetchError = err;
+            reject(new Error(err));
         });
 
         req.on('error', err => {
             isFetching = false;
+            lastFetchError = err.message;
             reject(err);
         });
     });
@@ -177,8 +200,8 @@ async function triggerFetchIfAllowed() {
     }
 }
 
-// Bucle dinámico cada 30 segundos
-setInterval(triggerFetchIfAllowed, 30000);
+// Reintento interno en segundo plano
+setInterval(triggerFetchIfAllowed, 20000);
 setTimeout(triggerFetchIfAllowed, 2000);
 
 app.get('/api/properties', async (req, res) => {
@@ -195,7 +218,7 @@ app.get('/api/properties', async (req, res) => {
             limit,
             hasMore: false,
             cachedAt: null,
-            note: "Enfriamiento activo de España. Reintentando de forma dinámica..."
+            note: `Enfriamiento o espera activa. Causa actual: ${lastFetchError}`
         });
     }
 

@@ -4,11 +4,12 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// La caché se inicializa en null de manera estricta para evitar la contaminación con arrays vacíos []
+// Caché interna en memoria RAM
 let cachedProperties = null;
 let lastCachedTime = 0;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas
-const MIN_VALID_CATALOG_SIZE = 30; // Bloqueo si el lote degradado es menor a 30
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // Caché de 4 Horas
+const MIN_VALID_CATALOG_SIZE = 30; // Escudo contra lotes degradados
+const BACKGROUND_PULL_INTERVAL = 1 * 60 * 60 * 1000; // Actualización automática de fondo cada 1 hora
 
 // Middleware de CORS completo
 app.use((req, res, next) => {
@@ -103,18 +104,20 @@ function parseSingleProperty(block) {
     };
 }
 
+// Descarga en memoria y parseo dinámico
 async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0&n=1000&i=True";
         
         const req = https.get(url, { timeout: 25000 }, (res) => {
             if (res.statusCode !== 200) {
-                reject(new Error(`API de origen respondió HTTP: ${res.statusCode}`));
+                reject(new Error(`API de origen respondió con estado HTTP: ${res.statusCode}`));
                 return;
             }
 
             let data = '';
             res.setEncoding('utf8');
+
             res.on('data', (chunk) => { data += chunk; });
 
             res.on('end', () => {
@@ -135,6 +138,7 @@ async function fetchAndParseXml() {
                     endTag = startTag.replace('<', '</');
                 } else {
                     const err = new Error("NO_PROPERTY_TAGS_FOUND");
+                    err.rawXmlSnippet = data.substring(0, 1000);
                     reject(err);
                     return;
                 }
@@ -146,11 +150,15 @@ async function fetchAndParseXml() {
                 for (let block of propertyBlocks) {
                     const cleanBlock = block.split(new RegExp(endTag, 'i'))[0];
                     const parsed = parseSingleProperty(cleanBlock);
-                    if (parsed) properties.push(parsed);
+                    if (parsed) {
+                        properties.push(parsed);
+                    }
                 }
 
                 if (properties.length === 0) {
-                    reject(new Error("PARSED_ZERO_PROPERTIES"));
+                    const err = new Error("PARSED_ZERO_PROPERTIES");
+                    err.rawXmlSnippet = data.substring(0, 1000);
+                    reject(err);
                     return;
                 }
 
@@ -169,6 +177,28 @@ async function fetchAndParseXml() {
     });
 }
 
+// Trabajador autónomo de actualización en segundo plano
+async function backgroundWorker() {
+    console.log("[Worker] Iniciando actualización autónoma de fondo...");
+    try {
+        const fetchedData = await fetchAndParseXml();
+        
+        if (cachedProperties && cachedProperties.length >= MIN_VALID_CATALOG_SIZE && fetchedData.length < MIN_VALID_CATALOG_SIZE) {
+            console.warn(`[Worker] Escudo de Caché Activo: Se rechazó un lote degradado de ${fetchedData.length} propiedades.`);
+        } else {
+            cachedProperties = fetchedData;
+            lastCachedTime = Date.now();
+            console.log(`[Worker] Actualización completada de forma autónoma. Total en RAM: ${cachedProperties.length}`);
+        }
+    } catch (error) {
+        console.warn("[Worker] La sincronización autónoma falló (reintentará en ciclo):", error.message);
+    }
+}
+
+setInterval(backgroundWorker, BACKGROUND_PULL_INTERVAL);
+setTimeout(backgroundWorker, 5000); // Disparo inicial a los 5 segundos de encendido
+
+// Ruta API Paginada para Wix Studio con control de errores HTTP 200
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
@@ -179,43 +209,55 @@ app.get('/api/properties', async (req, res) => {
     let warningMessage = null;
 
     if (!cachedProperties || cachedProperties.length === 0 || isCacheExpired || forceRefresh) {
-        console.log("[Proxy] Solicitando actualización de datos a España...");
+        console.log("[Proxy] Solicitando actualización de datos a Resales-Online...");
         try {
             const fetchedData = await fetchAndParseXml();
             
             if (cachedProperties && cachedProperties.length >= MIN_VALID_CATALOG_SIZE && fetchedData.length < MIN_VALID_CATALOG_SIZE) {
+                console.warn(`[Proxy] ESCUDO ACTIVO: Se bloqueó un lote degradado de ${fetchedData.length} elementos.`);
                 remoteCooldownActive = true;
-                warningMessage = `Lote externo degradado (${fetchedData.length} propiedades). Se retiene el catálogo saludable de ${cachedProperties.length} propiedades en RAM.`;
+                warningMessage = `Lote externo degradado (${fetchedData.length} propiedades). Se retiene el catálogo saludable de ${cachedProperties.length} propiedades.`;
+                res.setHeader('X-Cache-Status', 'STALE_DUE_TO_DEGRADATION');
             } else {
                 cachedProperties = fetchedData;
                 lastCachedTime = Date.now();
-                console.log(`[Proxy] Caché de RAM actualizada con éxito: ${cachedProperties.length} inmuebles.`);
+                res.setHeader('X-Cache-Status', 'MISS');
             }
         } catch (error) {
-            console.warn("[Proxy] La llamada remota falló:", error.message);
+            console.warn("[Proxy] La llamada de red externa falló. Causa:", error.message);
             remoteCooldownActive = true;
             warningMessage = error.message;
-
-            if (!cachedProperties || cachedProperties.length === 0) {
-                return res.status(503).json({
-                    status: "cooling_down",
-                    properties: [],
-                    total: 0,
-                    page,
-                    limit,
-                    hasMore: false,
-                    cachedAt: null,
-                    remote_cooldown: true,
-                    note: "El servidor proxy está en período de enfriamiento. Reintentando automáticamente...",
-                    warning: error.message
-                });
-            }
+            res.setHeader('X-Cache-Status', 'STALE_DUE_TO_ERROR');
         }
+    } else {
+        res.setHeader('X-Cache-Status', 'HIT');
+    }
+
+    // SI LA CACHÉ SIGUE TOTALMENTE VACÍA (Cold Start + Error de Red Inicial):
+    // Respondemos SIEMPRE con HTTP 200 e indicamos "cooling_down" para evitar errores HTTP 503 en Wix
+    if (!cachedProperties || cachedProperties.length === 0) {
+        return res.status(200).json({
+            status: "cooling_down",
+            properties: [],
+            total: 0,
+            page,
+            limit,
+            hasMore: false,
+            cachedAt: null,
+            remote_cooldown: true,
+            note: `El proxy está inicializando y España se encuentra en enfriamiento. Esperando primera sincronización. Detalle: ${warningMessage || "Esperando descarga inicial."}`,
+            warning: warningMessage
+        });
     }
 
     const startIndex = (page - 1) * limit;
     const endIndex = startIndex + limit;
     const paginatedItems = cachedProperties.slice(startIndex, endIndex);
+
+    let noteMessage = "Sincronización de caché activa y saludable.";
+    if (remoteCooldownActive) {
+        noteMessage = `Servidor en enfriamiento o lote externo degradado. ${warningMessage || ""}`;
+    }
 
     res.json({
         status: remoteCooldownActive ? "ready" : "success",
@@ -226,7 +268,7 @@ app.get('/api/properties', async (req, res) => {
         hasMore: endIndex < cachedProperties.length,
         cachedAt: lastCachedTime > 0 ? new Date(lastCachedTime).toISOString() : null,
         remote_cooldown: remoteCooldownActive,
-        note: "Sincronización de caché activa y saludable.",
+        note: noteMessage,
         warning: warningMessage
     });
 });

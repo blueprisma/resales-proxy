@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3000;
 // Variables de caché persistente en memoria RAM
 let cachedProperties = null;
 let lastCachedTime = 0;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // Caché de 4 Horas
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas
 
 // Middleware de CORS manual completo para compatibilidad con Wix Studio
 app.use((req, res, next) => {
@@ -24,19 +24,18 @@ app.use(express.json());
 
 // Saneamiento de textos con prioridad en traducción al español <es>
 function getCleanTagValue(block, tag) {
-    const regex = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i');
+    const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i');
     const match = block.match(regex);
     if (!match) return '';
     
     const innerContent = match[1].trim();
 
     // Priorizamos la etiqueta en español si existe traducción multilingüe
-    const esMatch = innerContent.match(/<es>([\s\S]*?)<\/es>/i);
+    const esMatch = innerContent.match(/<es[^>]*>([\s\S]*?)<\/es>/i);
     if (esMatch) {
         return esMatch[1].trim();
     }
 
-    // Si tiene otros subnodos HTML pero no es español, limpiamos etiquetas
     if (innerContent.includes('<') && innerContent.includes('>')) {
         return innerContent.replace(/<[^>]*>/g, '').trim();
     }
@@ -46,13 +45,11 @@ function getCleanTagValue(block, tag) {
 
 // Procesador individual tolerante a fallos para cada propiedad
 function parseSingleProperty(block) {
-    // ID único prioritario del nodo <id>
     const propertyid = getCleanTagValue(block, 'id') || getCleanTagValue(block, 'Reference') || getCleanTagValue(block, 'PropertyRefNo') || '';
-    if (!propertyid) return null; // Si no tiene un ID estructurado, descartamos la fila
+    if (!propertyid) return null;
 
     const title = getCleanTagValue(block, 'title') || getCleanTagValue(block, 'type') || `Propiedad Ref: ${propertyid}`;
     
-    // Mapeo geográfico priorizando town o city sobre área o localización
     const location = getCleanTagValue(block, 'town') || 
                      getCleanTagValue(block, 'city') || 
                      getCleanTagValue(block, 'area') || 
@@ -71,19 +68,27 @@ function parseSingleProperty(block) {
     const propertyType = getCleanTagValue(block, 'type') || 'Property';
     const description = getCleanTagValue(block, 'description') || getCleanTagValue(block, 'desc') || '';
 
-    // Extracción de todas las URLs de imágenes válidas (insensible a mayúsculas)
-    const imgRegex = /https?:\/\/[^<>\s"']+\.(?:jpg|jpeg|png|webp)/gi;
-    const matchedUrls = block.match(imgRegex) || [];
+    // EXTRACCIÓN UNIVERSAL DE IMÁGENES XML DE RESALES-ONLINE
+    let uniqueUrls = [];
+    const picturesMatch = block.match(/<(?:pictures|images|photos)[^>]*>([\s\S]*?)<\/(?:pictures|images|photos)>/i);
+    const searchBlock = picturesMatch ? picturesMatch[1] : block;
     
-    // Deduplicación de URLs de imágenes encontradas
-    const uniqueUrls = [...new Set(matchedUrls.map(url => url.trim()))];
-    
-    // images: String separado por comas de todas las fotos
+    // Busca las etiquetas nativas <Url>...</Url>
+    const urlTagMatches = searchBlock.match(/<url[^>]*>([^<]*)<\/url>/gi);
+    if (urlTagMatches) {
+        uniqueUrls = urlTagMatches.map(m => m.replace(/<\/?url[^>]*>/gi, '').trim()).filter(u => u.length > 0);
+    } else {
+        const rawUrlMatches = searchBlock.match(/https?:\/\/[^\s"<>]+\b/gi) || [];
+        uniqueUrls = [...new Set(rawUrlMatches.map(u => u.trim()))];
+    }
+
+    uniqueUrls = [...new Set(uniqueUrls)];
+
     const imagesStr = uniqueUrls.join(',');
     const mainimage = uniqueUrls.length > 0 ? uniqueUrls[0] : 'https://wixideas.wixsite.com/images/placeholder.png';
 
     return {
-        _id: propertyid, // Clave principal de Velo en Wix Studio
+        _id: propertyid,
         title,
         location,
         marketType,
@@ -102,10 +107,8 @@ function parseSingleProperty(block) {
 // Descarga en buffer y parseo seguro con detección de bloqueos
 async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
-        // Endpoint V3 Oficial del proyecto ININMO7 con flag de base de datos completa
         const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0";
         
-        // Timeout de conexión establecido a 20 segundos
         const req = https.get(url, { timeout: 20000 }, (res) => {
             if (res.statusCode !== 200) {
                 reject(new Error(`API de origen respondió con estado HTTP: ${res.statusCode}`));
@@ -115,12 +118,9 @@ async function fetchAndParseXml() {
             let data = '';
             res.setEncoding('utf8');
 
-            res.on('data', (chunk) => {
-                data += chunk;
-            });
+            res.on('data', (chunk) => { data += chunk; });
 
             res.on('end', () => {
-                // Validación del bloqueo concurrente en la respuesta del proveedor
                 const hasLockMessage = data.includes('previous instance') || 
                                        data.includes('Please wait') || 
                                        data.includes('running');
@@ -129,7 +129,6 @@ async function fetchAndParseXml() {
                     return;
                 }
 
-                // Detección dinámica de la envoltura de propiedad
                 let startTag = '';
                 let endTag = '';
 
@@ -166,9 +165,7 @@ async function fetchAndParseXml() {
                 resolve(properties);
             });
 
-            res.on('error', (err) => {
-                reject(err);
-            });
+            res.on('error', (err) => reject(err));
         });
 
         req.on('timeout', () => {
@@ -176,9 +173,7 @@ async function fetchAndParseXml() {
             reject(new Error("RESALES_CONNECTION_TIMEOUT"));
         });
 
-        req.on('error', (err) => {
-            reject(err);
-        });
+        req.on('error', (err) => reject(err));
     });
 }
 
@@ -188,13 +183,13 @@ app.get('/api/properties', async (req, res) => {
     const limit = parseInt(req.query.limit) || 200;
     const forceRefresh = req.query.refresh === 'true';
 
-    const isCacheExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
+    const isExpired = (Date.now() - lastCachedTime) > CACHE_DURATION;
     let remoteCooldownActive = false;
     let warningMessage = null;
     let noteMessage = "Sincronización de caché activa y saludable.";
     let rawXmlSnippet = "";
 
-    if (!cachedProperties || cachedProperties.length === 0 || isCacheExpired || forceRefresh) {
+    if (!cachedProperties || cachedProperties.length === 0 || isExpired || forceRefresh) {
         console.log("[Proxy] Solicitando actualización de datos a Resales-Online...");
         try {
             const fetchedData = await fetchAndParseXml();

@@ -22,7 +22,7 @@ function parseSingleProperty(block) {
 
     const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
     
-    // PRIORIZACIÓN: Town (Jávea, Dénia, Calpe...) -> Area -> Location -> Costa Blanca
+    // PRIORIZACIÓN DE PUEBLOS: Town (Jávea, Dénia, Calpe...) -> Area -> Location -> Costa Blanca
     const location = getTagValue('Town') || getTagValue('Area') || getTagValue('Location') || 'Costa Blanca';
     
     const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
@@ -70,17 +70,18 @@ function parseSingleProperty(block) {
     };
 }
 
-// Descarga en memoria y parseo flexible adaptativo
+// Descarga en memoria forzando el modo de catálogo completo (P_Inc=0)
 async function fetchAndParseXml() {
     return new Promise((resolve, reject) => {
-        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2";
+        // INYECCIÓN CLAVE: P_Inc=0 desactiva la exportación incremental y resetea el puntero
+        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0";
         
         const req = https.get(url, { 
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                 'Accept': '*/*'
             },
-            timeout: 15000 
+            timeout: 18000 
         }, (res) => {
             if (res.statusCode !== 200) {
                 reject(new Error(`Resales API respondió con código HTTP: ${res.statusCode}`));
@@ -104,7 +105,7 @@ async function fetchAndParseXml() {
                     return;
                 }
 
-                // Detección dinámica de la etiqueta contenedora de propiedades
+                // Detección dinámica de la etiqueta contenedora
                 let startTag = '';
                 let endTag = '';
 

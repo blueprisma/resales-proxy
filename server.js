@@ -19,7 +19,7 @@ let isSyncing = false;
 let lastError = null;
 const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas en memoria RAM
 
-// Extractor e interpretador de propiedades XML
+// Parser robusto e insensible a mayúsculas/minúsculas
 function parseXmlToProperties(xmlString) {
     const properties = [];
     if (!xmlString || typeof xmlString !== 'string') return properties;
@@ -90,17 +90,20 @@ function parseXmlToProperties(xmlString) {
     return properties;
 }
 
-function fetchXmlFromSpain(url) {
+function fetchXmlFromSpain() {
     return new Promise((resolve, reject) => {
+        // Consulta V3 estándar sin parámetros conflictivos de paginación forzada
+        const url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2`;
+
         const req = https.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                 'Accept': '*/*'
             },
-            timeout: 15000
+            timeout: 20000
         }, (res) => {
             if (res.statusCode !== 200) {
-                return reject(new Error(`HTTP ${res.statusCode} de España`));
+                return reject(new Error(`Estatus HTTP España: ${res.statusCode}`));
             }
 
             let data = '';
@@ -112,7 +115,7 @@ function fetchXmlFromSpain(url) {
 
         req.on('timeout', () => {
             req.destroy();
-            reject(new Error("Timeout de conexión con España (15s)"));
+            reject(new Error("Timeout de conexión con España (20s)"));
         });
         req.on('error', err => reject(err));
     });
@@ -122,17 +125,15 @@ async function syncCatalog() {
     if (isSyncing) return;
     isSyncing = true;
     lastError = null;
-    console.log("[Proxy] Solicitando propiedades a España...");
-
-    const primaryUrl = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&n=500&p1=1&p2=500&P_Inc=0`;
-    const fallbackUrl = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2`;
+    console.log("[Proxy] Solicitando exportación V3 a España...");
 
     try {
-        let rawXml = await fetchXmlFromSpain(primaryUrl);
-
-        if (rawXml.includes('previous instance') || rawXml.includes('Please wait') || rawXml.length < 300) {
-            console.warn("[Proxy] Respuesta corta o bloqueo detectado. Intentando URL secundaria...");
-            rawXml = await fetchXmlFromSpain(fallbackUrl);
+        const rawXml = await fetchXmlFromSpain();
+        
+        if (rawXml.includes('previous instance') || rawXml.includes('Please wait')) {
+            lastError = "El servidor de España está en enfriamiento (Cooldown).";
+            console.warn("[Proxy]", lastError);
+            return;
         }
 
         const parsed = parseXmlToProperties(rawXml);
@@ -141,7 +142,7 @@ async function syncCatalog() {
             lastCachedTime = Date.now();
             console.log(`[Proxy] Éxito: ${cachedProperties.length} propiedades en RAM.`);
         } else {
-            lastError = "El XML recibido de España no contiene propiedades con los filtros actuales.";
+            lastError = "El XML recibido no contenía bloques de propiedades válidos.";
             console.warn("[Proxy]", lastError);
         }
     } catch (err) {
@@ -175,7 +176,7 @@ app.get('/api/properties', async (req, res) => {
         limit,
         hasMore: endIndex < cachedProperties.length,
         cachedAt: lastCachedTime > 0 ? new Date(lastCachedTime).toISOString() : null,
-        note: lastError || (cachedProperties.length === 0 ? "Iniciando carga de datos..." : null)
+        note: lastError || null
     });
 });
 

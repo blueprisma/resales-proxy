@@ -4,14 +4,17 @@ import https from 'https';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-let cachedProperties = null;
-let lastCachedTime = 0;
-let isFetching = false;
-let lastFetchAttempt = 0;
-let lastFetchError = "Esperando primer intento de conexión...";
+const RESALES_USER = process.env.RESALES_USER || 'RESALES@ININMO7';
+const RESALES_PASS = process.env.RESALES_PASS || 'ZWO3WPZ7UU';
 
-const EMPTY_RETRY_COOLDOWN_MS = 90 * 1000; // 90 segundos de pausa entre reintentos en frío
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 horas de vida de la caché llena
+// Map en memoria RAM para asegurar unicidad por referencia (_id)
+let cachedPropertiesMap = new Map();
+let lastCachedTime = 0;
+let isSyncing = false;
+let hasPerformedCleanLoad = false;
+let lastSyncError = "Esperando primera sincronización...";
+
+const PAGE_SIZE = 500; // Tamaño recomendado por Resales-Online
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -86,29 +89,23 @@ function parseSingleProperty(block) {
     };
 }
 
-async function fetchAndParseXml() {
-    if (isFetching) throw new Error("FETCH_ALREADY_IN_PROGRESS");
-    isFetching = true;
-    lastFetchAttempt = Date.now();
-
+function fetchXmlPage(isCleanLoadFirstCall) {
     return new Promise((resolve, reject) => {
-        const url = "https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&P_Inc=0";
-        
-        // Opciones con cabecera de navegador real para evitar bloqueos
+        let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${PAGE_SIZE}`;
+        if (isCleanLoadFirstCall) {
+            url += '&I=TRUE'; // Forzamos reseteo de puntero incremental
+        }
+
         const options = {
             timeout: 30000,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
             }
         };
 
         const req = https.get(url, options, (res) => {
             if (res.statusCode !== 200) {
-                isFetching = false;
-                const err = `API respondió con código HTTP ${res.statusCode}`;
-                lastFetchError = err;
-                return reject(new Error(err));
+                return reject(new Error(`Resales respondió HTTP ${res.statusCode}`));
             }
 
             let data = '';
@@ -116,11 +113,8 @@ async function fetchAndParseXml() {
             res.on('data', chunk => data += chunk);
 
             res.on('end', () => {
-                isFetching = false;
                 if (data.includes('previous instance') || data.includes('Please wait') || data.includes('running')) {
-                    const err = "Bloqueo por consulta concurrente en España (previous instance running)";
-                    lastFetchError = err;
-                    return reject(new Error(err));
+                    return reject(new Error("RESALES_CONCURRENCY_LOCK"));
                 }
 
                 let startTag = '';
@@ -130,10 +124,7 @@ async function fetchAndParseXml() {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
                 } else {
-                    const snippet = data.substring(0, 150).replace(/(\r\n|\n|\r)/gm, " ");
-                    const err = `Respuesta no contiene XML de propiedades. Muestra: "${snippet}"`;
-                    lastFetchError = err;
-                    return reject(new Error(err));
+                    return resolve([]); // Retorna array vacío si vino la cáscara limpia
                 }
 
                 const properties = [];
@@ -146,70 +137,83 @@ async function fetchAndParseXml() {
                     if (parsed) properties.push(parsed);
                 }
 
-                if (properties.length === 0) {
-                    const err = "El parser procesó 0 propiedades del XML recibido.";
-                    lastFetchError = err;
-                    return reject(new Error(err));
-                }
-
-                lastFetchError = "Ninguno (Sincronizado con éxito)";
                 resolve(properties);
             });
 
-            res.on('error', err => {
-                isFetching = false;
-                lastFetchError = err.message;
-                reject(err);
-            });
+            res.on('error', err => reject(err));
         });
 
         req.on('timeout', () => {
             req.destroy();
-            isFetching = false;
-            const err = "Tiempo de espera agotado al conectar con España (30s timeout)";
-            lastFetchError = err;
-            reject(new Error(err));
+            reject(new Error("TIMEOUT_CONNECTING_TO_RESALES"));
         });
 
-        req.on('error', err => {
-            isFetching = false;
-            lastFetchError = err.message;
-            reject(err);
-        });
+        req.on('error', err => reject(err));
     });
 }
 
-async function triggerFetchIfAllowed() {
-    const timeSinceLast = Date.now() - lastFetchAttempt;
-    const cooldownNeeded = (!cachedProperties || cachedProperties.length === 0) ? EMPTY_RETRY_COOLDOWN_MS : CACHE_DURATION;
+async function runSyncCycle() {
+    if (isSyncing) return;
+    isSyncing = true;
 
-    if (isFetching || (lastFetchAttempt > 0 && timeSinceLast < cooldownNeeded)) {
-        return;
-    }
+    const isThisACleanLoad = !hasPerformedCleanLoad;
+    console.log(`[Proxy Worker] Iniciando ciclo (${isThisACleanLoad ? 'CLEAN LOAD I=TRUE' : 'Incremental'})...`);
 
     try {
-        console.log("[Proxy Worker] Consultando catálogo a España...");
-        const data = await fetchAndParseXml();
-        if (data && data.length >= 10) {
-            cachedProperties = data;
-            lastCachedTime = Date.now();
-            console.log(`[Proxy Worker SUCCESS] RAM poblada con ${cachedProperties.length} inmuebles.`);
+        let pageCount = 0;
+        let totalReceived = 0;
+
+        while (pageCount < 20) {
+            const isFirstCallOfClean = isThisACleanLoad && pageCount === 0;
+            const properties = await fetchXmlPage(isFirstCallOfClean);
+
+            pageCount++;
+
+            if (properties.length === 0) {
+                console.log(`[Proxy Worker] Ciclo finalizado. Pagina ${pageCount} devolvió 0 registros.`);
+                break;
+            }
+
+            for (const p of properties) {
+                cachedPropertiesMap.set(p._id, p);
+            }
+
+            totalReceived += properties.length;
+            console.log(`[Proxy Worker] Pagina ${pageCount}: ${properties.length} propiedades (Acumulado RAM: ${cachedPropertiesMap.size}).`);
+
+            if (properties.length < PAGE_SIZE) break;
         }
+
+        if (cachedPropertiesMap.size > 0) {
+            hasPerformedCleanLoad = true;
+            lastCachedTime = Date.now();
+            lastSyncError = "Sincronizado con éxito";
+        } else {
+            lastSyncError = "El servidor de España entregó cáscara vacía. Se requiere habilitar Development Parameters en Soporte de Resales.";
+        }
+
     } catch (err) {
-        console.warn("[Proxy Worker WARN] Intento no completado:", err.message);
+        console.warn("[Proxy Worker WARN] Fallo en ciclo de sincronización:", err.message);
+        lastSyncError = err.message;
+    } finally {
+        isSyncing = false;
     }
 }
 
-// Reintento interno en segundo plano
-setInterval(triggerFetchIfAllowed, 20000);
-setTimeout(triggerFetchIfAllowed, 2000);
+// Bucle en segundo plano cada 2 minutos si la RAM está vacía
+setInterval(() => {
+    if (cachedPropertiesMap.size === 0) runSyncCycle();
+}, 2 * 60 * 1000);
+
+setTimeout(runSyncCycle, 2000);
 
 app.get('/api/properties', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
+    const allItems = Array.from(cachedPropertiesMap.values());
 
-    if (!cachedProperties || cachedProperties.length === 0) {
-        triggerFetchIfAllowed();
+    if (allItems.length === 0) {
+        runSyncCycle();
         return res.status(200).json({
             status: "cooling_down",
             properties: [],
@@ -218,21 +222,21 @@ app.get('/api/properties', async (req, res) => {
             limit,
             hasMore: false,
             cachedAt: null,
-            note: `Enfriamiento o espera activa. Causa actual: ${lastFetchError}`
+            note: `El proxy está ejecutando la carga inicial (Clean Load I=TRUE). Estado actual: ${lastSyncError}`
         });
     }
 
     const startIndex = (page - 1) * limit;
     const endIndex = startIndex + limit;
-    const paginatedItems = cachedProperties.slice(startIndex, endIndex);
+    const paginatedItems = allItems.slice(startIndex, endIndex);
 
     res.json({
         status: "success",
         properties: paginatedItems,
-        total: cachedProperties.length,
+        total: allItems.length,
         page,
         limit,
-        hasMore: endIndex < cachedProperties.length,
+        hasMore: endIndex < allItems.length,
         cachedAt: new Date(lastCachedTime).toISOString(),
         note: "Datos servidos desde memoria RAM protegida."
     });

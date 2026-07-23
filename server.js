@@ -10,9 +10,10 @@ const RESALES_PASS = process.env.RESALES_PASS || 'ZWO3WPZ7UU';
 let cachedPropertiesMap = new Map();
 let lastCachedTime = 0;
 let isSyncing = false;
-let lastSyncStatusMessage = "Iniciando carga limpia de 5 días...";
+let lastSyncStatusMessage = "Iniciando carga limpia...";
+let cooldownUntil = 0;
 
-const PAGE_SIZE = 500; // Tamaño de lote oficial documentado por Resales-Online
+const PAGE_SIZE = 500;
 
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -89,14 +90,13 @@ function parseSingleProperty(block) {
 
 function fetchXmlPage(isCleanLoadFirstCall) {
     return new Promise((resolve, reject) => {
-        // Regla Oficial: &I=TRUE SOLO en la primera llamada de la carga limpia.
         let url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=${encodeURIComponent(RESALES_USER)}&P=${encodeURIComponent(RESALES_PASS)}&FV=2&N=${PAGE_SIZE}`;
         if (isCleanLoadFirstCall) {
             url += '&I=TRUE';
         }
 
         const options = {
-            timeout: 45000,
+            timeout: 60000,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
             }
@@ -112,7 +112,8 @@ function fetchXmlPage(isCleanLoadFirstCall) {
             res.on('data', chunk => data += chunk);
 
             res.on('end', () => {
-                if (data.includes('previous instance') || data.includes('Please wait') || data.includes('running')) {
+                const lowerData = data.toLowerCase();
+                if (lowerData.includes('previous instance') || lowerData.includes('please wait') || lowerData.includes('running')) {
                     return reject(new Error("RESALES_CONCURRENCY_LOCK"));
                 }
 
@@ -123,7 +124,7 @@ function fetchXmlPage(isCleanLoadFirstCall) {
                     startTag = tagMatch[0];
                     endTag = startTag.replace('<', '</');
                 } else {
-                    return resolve([]); // Cáscara vacía / fin de lista
+                    return resolve([]); 
                 }
 
                 const properties = [];
@@ -153,26 +154,28 @@ function fetchXmlPage(isCleanLoadFirstCall) {
 
 async function runSyncCycle() {
     if (isSyncing) return;
-    isSyncing = true;
+    if (Date.now() < cooldownUntil) {
+        console.log(`[Proxy Worker] Enfriamiento activo. Esperando a que España termine su proceso.`);
+        return;
+    }
 
-    console.log("[Proxy Worker] Ejecutando Clean Load oficial con Parámetros de Desarrollo...");
+    isSyncing = true;
+    console.log("[Proxy Worker] Iniciando ciclo de descarga en segundo plano desde España...");
 
     try {
         let pageCount = 0;
-        let totalReceivedInCycle = 0;
         let keepFetching = true;
 
         while (keepFetching && pageCount < 30) {
-            // isCleanLoadFirstCall = true UNICAMENTE en la primera iteracion (pageCount === 0)
-            const isFirstCall = (pageCount === 0);
+            const isFirstCall = (pageCount === 0 && cachedPropertiesMap.size === 0);
             
-            console.log(`[Proxy Worker] Solicitando lote ${pageCount + 1} (${isFirstCall ? 'con I=TRUE' : 'incremental N=500'})...`);
+            console.log(`[Proxy Worker] Solicitando lote ${pageCount + 1} (${isFirstCall ? 'Clean Load I=TRUE' : 'N=500'})...`);
             
             const properties = await fetchXmlPage(isFirstCall);
             pageCount++;
 
             if (properties.length === 0) {
-                console.log(`[Proxy Worker] Lote ${pageCount} devolvió 0 propiedades. Fin de la descarga de España.`);
+                console.log(`[Proxy Worker] Lote ${pageCount} devolvió 0 propiedades. Fin de la descarga.`);
                 keepFetching = false;
                 break;
             }
@@ -181,11 +184,10 @@ async function runSyncCycle() {
                 cachedPropertiesMap.set(p._id, p);
             }
 
-            totalReceivedInCycle += properties.length;
-            console.log(`[Proxy Worker] Lote ${pageCount} recibido: ${properties.length} propiedades (Total acumulado en RAM: ${cachedPropertiesMap.size}).`);
+            console.log(`[Proxy Worker] Lote ${pageCount} recibido: ${properties.length} propiedades (Total en RAM: ${cachedPropertiesMap.size}).`);
 
             if (properties.length < PAGE_SIZE) {
-                keepFetching = false; // Última página devuelta por España
+                keepFetching = false;
             }
         }
 
@@ -193,27 +195,38 @@ async function runSyncCycle() {
             lastCachedTime = Date.now();
             lastSyncStatusMessage = "Sincronización exitosa completa.";
         } else {
-            lastSyncStatusMessage = "España respondió con 0 propiedades en el Clean Load.";
+            lastSyncStatusMessage = "España devolvió 0 propiedades.";
         }
 
     } catch (err) {
-        console.warn("[Proxy Worker WARN] Fallo en ciclo de sincronización:", err.message);
+        console.warn("[Proxy Worker WARN] Fallo en ciclo:", err.message);
         lastSyncStatusMessage = err.message;
+
+        if (err.message === "RESALES_CONCURRENCY_LOCK") {
+            cooldownUntil = Date.now() + (3 * 60 * 1000);
+            lastSyncStatusMessage = "España está generando el paquete XML en su servidor. Enfriamiento de 3 minutos activado en Render.";
+        }
     } finally {
         isSyncing = false;
     }
 }
 
-// Bucle en segundo plano: dispara la sincronización automáticamente al encender
-setTimeout(runSyncCycle, 2000);
+// Bucle en segundo plano cada 40 segundos (no afectado por peticiones HTTP)
+setInterval(() => {
+    if (cachedPropertiesMap.size === 0 && !isSyncing) {
+        runSyncCycle();
+    }
+}, 40000);
 
-app.get('/api/properties', async (req, res) => {
+// Disparo inicial a los 3 segundos
+setTimeout(runSyncCycle, 3000);
+
+app.get('/api/properties', (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 200;
     const allItems = Array.from(cachedPropertiesMap.values());
 
     if (allItems.length === 0) {
-        if (!isSyncing) runSyncCycle();
         return res.status(200).json({
             status: "cooling_down",
             properties: [],
@@ -222,7 +235,7 @@ app.get('/api/properties', async (req, res) => {
             limit,
             hasMore: false,
             cachedAt: null,
-            note: `Procesando Clean Load desde España. Estado: ${lastSyncStatusMessage}`
+            note: `Procesando en segundo plano en Render. Estado actual: ${lastSyncStatusMessage}`
         });
     }
 

@@ -15,7 +15,7 @@ app.use((req, res, next) => {
 let cachedProperties = [];
 let lastCachedTime = 0;
 let isSyncing = false;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas de memoria RAM
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas en RAM
 
 function parsePropertiesFromXml(xmlString) {
     const properties = [];
@@ -40,7 +40,15 @@ function parsePropertiesFromXml(xmlString) {
         if (!propertyid) continue;
 
         const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
-        const location = getTagValue('Area') || getTagValue('Location') || getTagValue('Town') || 'Costa Blanca';
+        
+        // CORRECCIÓN CRÍTICA: Priorizamos el PUEBLO (Town) sobre el Área genérica (Costa Blanca)
+        const pueblo = getTagValue('Town') || getTagValue('City') || getTagValue('Municipality');
+        const urbanizacion = getTagValue('Location') || getTagValue('Urbanisation');
+        const areaMacro = getTagValue('Area') || 'Costa Blanca';
+
+        // Estructura de ubicación precisa para los filtros de Zuzanna (ej. Jávea, Dénia, Calpe)
+        const location = pueblo || urbanizacion || areaMacro;
+
         const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
         const marketType = isNewDev ? 'New Development' : 'Resale';
         const price = parseFloat(getTagValue('Price')) || 0;
@@ -64,7 +72,7 @@ function parsePropertiesFromXml(xmlString) {
         properties.push({
             _id: propertyid,
             title,
-            location,
+            location, // Ahora entregará Jávea, Dénia, Calpe, Altea, etc.
             marketType,
             price,
             beds,
@@ -83,7 +91,6 @@ function parsePropertiesFromXml(xmlString) {
 
 function fetchBatch(p1 = 1, p2 = 500) {
     return new Promise((resolve, reject) => {
-        // URL Oficial con Paginación Batch de 500 (Protocolo Oficial de Resales Online)
         const url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&n=500&p1=${p1}&p2=${p2}`;
 
         https.get(url, {
@@ -109,7 +116,7 @@ async function downloadAllPropertiesInBatches() {
     if (isSyncing) return cachedProperties;
     isSyncing = true;
 
-    console.log("[Proxy] Iniciando descarga secuencial por lotes de 500 (Protocolo Oficial)...");
+    console.log("[Proxy] Descargando catálogo por lotes de 500 con mapeo de Pueblos...");
     let allItems = [];
     let p1 = 1;
     let p2 = 500;
@@ -122,24 +129,22 @@ async function downloadAllPropertiesInBatches() {
             const xmlData = await fetchBatch(p1, p2);
 
             if (xmlData.includes('previous instance') || xmlData.includes('Please wait')) {
-                console.warn("[Proxy] Servidor de España requiere enfriamiento temporal.");
+                console.warn("[Proxy] Enfriamiento en servidor de España.");
                 break;
             }
 
             const parsedBatch = parsePropertiesFromXml(xmlData);
 
             if (parsedBatch.length === 0) {
-                console.log("[Proxy] Fin de la transmisión. Lote vacío recibido.");
                 hasMore = false;
             } else {
                 allItems = allItems.concat(parsedBatch);
                 p1 += 500;
                 p2 += 500;
-                // Pequeña pausa de 300ms entre lotes para respetar el servidor de España
                 await new Promise(r => setTimeout(r, 300));
             }
         } catch (err) {
-            console.error(`[Proxy] Error descargando lote ${p1}-${p2}:`, err.message);
+            console.error(`[Proxy] Error en lote ${p1}-${p2}:`, err.message);
             consecutiveErrors++;
         }
     }
@@ -147,7 +152,7 @@ async function downloadAllPropertiesInBatches() {
     if (allItems.length > 0) {
         cachedProperties = allItems;
         lastCachedTime = Date.now();
-        console.log(`[Proxy] Descarga masiva completada. Total propiedades en RAM: ${cachedProperties.length}`);
+        console.log(`[Proxy] Proceso completado. Total inmuebles con pueblos asignados: ${cachedProperties.length}`);
     }
 
     isSyncing = false;
@@ -170,7 +175,7 @@ app.get('/api/properties', async (req, res) => {
             if (cachedProperties.length === 0) {
                 return res.json({
                     status: "processing",
-                    message: "Descargando catálogo de 12,000+ propiedades por lotes de 500. Por favor recarga en 30 segundos.",
+                    message: "Mapeando pueblos (Jávea, Dénia, Calpe, Altea...). Recarga en 30 segundos.",
                     total: 0,
                     properties: []
                 });

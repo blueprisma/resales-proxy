@@ -15,7 +15,7 @@ app.use((req, res, next) => {
 let cachedProperties = [];
 let lastCachedTime = 0;
 let isSyncing = false;
-const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas en RAM
+const CACHE_DURATION = 4 * 60 * 60 * 1000; // 4 Horas en memoria RAM
 
 function parsePropertiesFromXml(xmlString) {
     const properties = [];
@@ -41,12 +41,11 @@ function parsePropertiesFromXml(xmlString) {
 
         const title = getTagValue('Title') || `Propiedad Ref: ${propertyid}`;
         
-        // CORRECCIÓN CRÍTICA: Priorizamos el PUEBLO (Town) sobre el Área genérica (Costa Blanca)
+        // Mapeo preciso de PUEBLOS (Jávea, Dénia, Calpe, Altea, Moraira...)
         const pueblo = getTagValue('Town') || getTagValue('City') || getTagValue('Municipality');
         const urbanizacion = getTagValue('Location') || getTagValue('Urbanisation');
         const areaMacro = getTagValue('Area') || 'Costa Blanca';
 
-        // Estructura de ubicación precisa para los filtros de Zuzanna (ej. Jávea, Dénia, Calpe)
         const location = pueblo || urbanizacion || areaMacro;
 
         const isNewDev = getTagValue('NewDevelopment') === '1' || getTagValue('NewDevelopment') === 'true';
@@ -72,7 +71,7 @@ function parsePropertiesFromXml(xmlString) {
         properties.push({
             _id: propertyid,
             title,
-            location, // Ahora entregará Jávea, Dénia, Calpe, Altea, etc.
+            location,
             marketType,
             price,
             beds,
@@ -91,7 +90,8 @@ function parsePropertiesFromXml(xmlString) {
 
 function fetchBatch(p1 = 1, p2 = 500) {
     return new Promise((resolve, reject) => {
-        const url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&n=500&p1=${p1}&p2=${p2}`;
+        // INYECCIÓN CRÍTICA: P_Inc=0 desactiva el modo incremental y fuerza la entrega del CATÁLOGO COMPLETO
+        const url = `https://xmlout.resales-online.com/live/Resales/Export/CreateXMLFeedV3.asp?U=RESALES@ININMO7&P=ZWO3WPZ7UU&FV=2&n=500&p1=${p1}&p2=${p2}&P_Inc=0`;
 
         https.get(url, {
             headers: {
@@ -116,7 +116,7 @@ async function downloadAllPropertiesInBatches() {
     if (isSyncing) return cachedProperties;
     isSyncing = true;
 
-    console.log("[Proxy] Descargando catálogo por lotes de 500 con mapeo de Pueblos...");
+    console.log("[Proxy] Forzando descarga del catálogo COMPLETO (P_Inc=0)...");
     let allItems = [];
     let p1 = 1;
     let p2 = 500;
@@ -152,7 +152,7 @@ async function downloadAllPropertiesInBatches() {
     if (allItems.length > 0) {
         cachedProperties = allItems;
         lastCachedTime = Date.now();
-        console.log(`[Proxy] Proceso completado. Total inmuebles con pueblos asignados: ${cachedProperties.length}`);
+        console.log(`[Proxy] Proceso completado. Total inmuebles en memoria RAM: ${cachedProperties.length}`);
     }
 
     isSyncing = false;
@@ -175,7 +175,7 @@ app.get('/api/properties', async (req, res) => {
             if (cachedProperties.length === 0) {
                 return res.json({
                     status: "processing",
-                    message: "Mapeando pueblos (Jávea, Dénia, Calpe, Altea...). Recarga en 30 segundos.",
+                    message: "Descargando catálogo COMPLETO sin filtro incremental. Recarga en 30 segundos.",
                     total: 0,
                     properties: []
                 });
